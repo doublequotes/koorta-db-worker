@@ -1,0 +1,10 @@
+name = "koorta-db-worker"
+main = "src/index.js"
+compatibility_date = "2026-08-10"
+
+[vars]
+ALLOWED_ORIGIN = "*"
+
+[[d1_databases]]
+binding = "KOORTA_DB"
+database_name = "koorta_db"
