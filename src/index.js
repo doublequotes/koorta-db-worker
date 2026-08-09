@@ -174,177 +174,183 @@ export default {
     const route = normalizeRoute(url.pathname);
     const corsHeaders = getCorsHeaders(env);
 
-    if (method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          ...corsHeaders,
-          'Access-Control-Max-Age': '86400',
-        },
-      });
-    }
+    try {
+      if (method === 'OPTIONS') {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            ...corsHeaders,
+            'Access-Control-Max-Age': '86400',
+          },
+        });
+      }
 
       if (!env.KOORTA_DB) {
-      return buildError('D1 binding KOORTA_DB is not configured.', 500, corsHeaders);
-    }
-
-    if (route === '/') {
-      return jsonResponse({ success: true, message: 'Koorta DB API is running.' }, 200, corsHeaders);
-    }
-
-    if (route.startsWith('/orders')) {
-      if (method === 'GET') {
-        const parts = route.split('/').filter(Boolean);
-        if (parts.length === 2) {
-          const orderNumber = parts[1];
-          const record = await getOrder(env.KOORTA_DB, orderNumber);
-          if (!record) return buildError('Order not found.', 404, corsHeaders);
-          return jsonResponse({ success: true, order: record }, 200, corsHeaders);
-        }
-
-        const email = String(url.searchParams.get('email') || '').trim();
-        const phone = String(url.searchParams.get('phone') || '').trim();
-        if (!email && !phone) {
-          return buildError('Provide email or phone to look up orders.', 400, corsHeaders);
-        }
-
-        const conditions = [];
-        const values = [];
-        if (email) {
-          conditions.push('customer_email = ?');
-          values.push(email);
-        }
-        if (phone) {
-          conditions.push('customer_phone = ?');
-          values.push(phone);
-        }
-
-        const query = `SELECT order_number, placed_at, payment_method, total, status FROM orders WHERE ${conditions.join(' OR ')} ORDER BY placed_at DESC LIMIT 25`;
-        const listResult = await env.KOORTA_DB.prepare(query).bind(...values).all();
-        return jsonResponse({ success: true, orders: listResult.results || [] }, 200, corsHeaders);
+        return buildError('D1 binding KOORTA_DB is not configured.', 500, corsHeaders);
       }
 
-      if (method === 'POST') {
-        const apiKey = request.headers.get('x-koorta-db-api-key') || '';
-        if (!env.KOORTA_DB_WORKER_API_SECRET || apiKey !== env.KOORTA_DB_WORKER_API_SECRET) {
-          return buildError('Unauthorized request.', 401, corsHeaders);
-        }
-
-        const payload = await parseJson(request);
-        const validationError = validateOrderPayload(payload);
-        if (validationError) {
-          return buildError(validationError, 400, corsHeaders);
-        }
-
-        const order = normalizeOrderPayload(payload);
-        if (!order.orderNumber) {
-          return buildError('Order number is required.', 400);
-        }
-
-        const existing = await env.KOORTA_DB.prepare('SELECT order_number FROM orders WHERE order_number = ?').bind(order.orderNumber).first();
-        if (existing) {
-          return buildError('Order number already exists.', 409, corsHeaders);
-        }
-
-        const tx = await env.KOORTA_DB
-          .prepare(
-            `INSERT INTO orders (
-              order_number,
-              placed_at,
-              customer_name,
-              customer_email,
-              customer_phone,
-              customer_address,
-              customer_city,
-              customer_state,
-              customer_district,
-              customer_post_office,
-              customer_pincode,
-              customer_notes,
-              payment_method,
-              upi_id,
-              subtotal,
-              discount,
-              promo_code,
-              shipping,
-              total,
-              status,
-              created_at,
-              updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          )
-          .bind(
-            order.orderNumber,
-            order.placedAt,
-            order.customer.name,
-            order.customer.email,
-            order.customer.phone,
-            order.customer.address,
-            order.customer.city,
-            order.customer.state,
-            order.customer.district,
-            order.customer.postOffice,
-            order.customer.pincode,
-            order.customer.notes || null,
-            order.payment,
-            order.upiId || null,
-            order.subtotal,
-            order.discount,
-            order.promoCode || null,
-            order.shipping,
-            order.total,
-            'pending',
-            nowISOString(),
-            nowISOString(),
-          )
-          .run();
-
-        if (!tx.success) {
-          return buildError('Failed to persist order.', 500, corsHeaders);
-        }
-
-        const itemInserts = env.KOORTA_DB.prepare(
-          `INSERT INTO order_items (order_number, item_id, name, size, quantity, price, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        );
-
-        for (const item of order.items) {
-          await itemInserts.bind(
-            order.orderNumber,
-            item.itemId,
-            item.name,
-            item.size,
-            item.qty,
-            item.price,
-            item.image || null,
-          ).run();
-        }
-
-        const transactionId = `tx-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-        const transactionInsert = await env.KOORTA_DB.prepare(
-          `INSERT INTO transactions (transaction_id, order_number, provider, method, status, amount, external_reference, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-          .bind(
-            transactionId,
-            order.orderNumber,
-            order.payment === 'upi' ? 'upi' : 'manual',
-            order.payment,
-            'pending',
-            order.total,
-            null,
-            JSON.stringify({ orderPlacedVia: order.payment }),
-            nowISOString(),
-            nowISOString(),
-          )
-          .run();
-
-        if (!transactionInsert.success) {
-          return buildError('Failed to persist transaction details.', 500, corsHeaders);
-        }
-
-        return jsonResponse({ success: true, orderNumber: order.orderNumber, status: 'pending', transactionId }, 201, corsHeaders);
+      if (route === '/') {
+        return jsonResponse({ success: true, message: 'Koorta DB API is running.' }, 200, corsHeaders);
       }
-    }
 
-    return buildError('Not found.', 404, corsHeaders);
+      if (route.startsWith('/orders')) {
+        if (method === 'GET') {
+          const parts = route.split('/').filter(Boolean);
+          if (parts.length === 2) {
+            const orderNumber = parts[1];
+            const record = await getOrder(env.KOORTA_DB, orderNumber);
+            if (!record) return buildError('Order not found.', 404, corsHeaders);
+            return jsonResponse({ success: true, order: record }, 200, corsHeaders);
+          }
+
+          const email = String(url.searchParams.get('email') || '').trim();
+          const phone = String(url.searchParams.get('phone') || '').trim();
+          if (!email && !phone) {
+            return buildError('Provide email or phone to look up orders.', 400, corsHeaders);
+          }
+
+          const conditions = [];
+          const values = [];
+          if (email) {
+            conditions.push('customer_email = ?');
+            values.push(email);
+          }
+          if (phone) {
+            conditions.push('customer_phone = ?');
+            values.push(phone);
+          }
+
+          const query = `SELECT order_number, placed_at, payment_method, total, status FROM orders WHERE ${conditions.join(' OR ')} ORDER BY placed_at DESC LIMIT 25`;
+          const listResult = await env.KOORTA_DB.prepare(query).bind(...values).all();
+          return jsonResponse({ success: true, orders: listResult.results || [] }, 200, corsHeaders);
+        }
+
+        if (method === 'POST') {
+          const apiKey = request.headers.get('x-koorta-db-api-key') || '';
+          if (!env.KOORTA_DB_WORKER_API_SECRET || apiKey !== env.KOORTA_DB_WORKER_API_SECRET) {
+            return buildError('Unauthorized request.', 401, corsHeaders);
+          }
+
+          const payload = await parseJson(request);
+          const validationError = validateOrderPayload(payload);
+          if (validationError) {
+            return buildError(validationError, 400, corsHeaders);
+          }
+
+          const order = normalizeOrderPayload(payload);
+          if (!order.orderNumber) {
+            return buildError('Order number is required.', 400, corsHeaders);
+          }
+
+          const existing = await env.KOORTA_DB.prepare('SELECT order_number FROM orders WHERE order_number = ?').bind(order.orderNumber).first();
+          if (existing) {
+            return buildError('Order number already exists.', 409, corsHeaders);
+          }
+
+          const tx = await env.KOORTA_DB
+            .prepare(
+              `INSERT INTO orders (
+                order_number,
+                placed_at,
+                customer_name,
+                customer_email,
+                customer_phone,
+                customer_address,
+                customer_city,
+                customer_state,
+                customer_district,
+                customer_post_office,
+                customer_pincode,
+                customer_notes,
+                payment_method,
+                upi_id,
+                subtotal,
+                discount,
+                promo_code,
+                shipping,
+                total,
+                status,
+                created_at,
+                updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .bind(
+              order.orderNumber,
+              order.placedAt,
+              order.customer.name,
+              order.customer.email,
+              order.customer.phone,
+              order.customer.address,
+              order.customer.city,
+              order.customer.state,
+              order.customer.district,
+              order.customer.postOffice,
+              order.customer.pincode,
+              order.customer.notes || null,
+              order.payment,
+              order.upiId || null,
+              order.subtotal,
+              order.discount,
+              order.promoCode || null,
+              order.shipping,
+              order.total,
+              'pending',
+              nowISOString(),
+              nowISOString(),
+            )
+            .run();
+
+          if (!tx.success) {
+            return buildError('Failed to persist order.', 500, corsHeaders);
+          }
+
+          const itemInserts = env.KOORTA_DB.prepare(
+            `INSERT INTO order_items (order_number, item_id, name, size, quantity, price, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          );
+
+          for (const item of order.items) {
+            await itemInserts.bind(
+              order.orderNumber,
+              item.itemId,
+              item.name,
+              item.size,
+              item.qty,
+              item.price,
+              item.image || null,
+            ).run();
+          }
+
+          const transactionId = `tx-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+          const transactionInsert = await env.KOORTA_DB.prepare(
+            `INSERT INTO transactions (transaction_id, order_number, provider, method, status, amount, external_reference, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+            .bind(
+              transactionId,
+              order.orderNumber,
+              order.payment === 'upi' ? 'upi' : 'manual',
+              order.payment,
+              'pending',
+              order.total,
+              null,
+              JSON.stringify({ orderPlacedVia: order.payment }),
+              nowISOString(),
+              nowISOString(),
+            )
+            .run();
+
+          if (!transactionInsert.success) {
+            return buildError('Failed to persist transaction details.', 500, corsHeaders);
+          }
+
+          return jsonResponse({ success: true, orderNumber: order.orderNumber, status: 'pending', transactionId }, 201, corsHeaders);
+        }
+      }
+
+      return buildError('Not found.', 404, corsHeaders);
+    } catch (error) {
+      console.error('Worker exception:', error);
+      const message = error instanceof Error ? error.message : String(error);
+      return buildError(`Internal worker error: ${message}`, 500, corsHeaders);
+    }
   },
 };
