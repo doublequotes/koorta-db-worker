@@ -133,6 +133,11 @@ async function getOrder(db, orderNumber) {
     .bind(orderNumber)
     .all();
 
+  const transactionsResult = await db
+    .prepare('SELECT transaction_id, provider, method, status, amount, external_reference, metadata, created_at, updated_at FROM transactions WHERE order_number = ?')
+    .bind(orderNumber)
+    .all();
+
   return {
     orderNumber: orderResult.order_number,
     placedAt: orderResult.placed_at,
@@ -163,6 +168,17 @@ async function getOrder(db, orderNumber) {
       qty: item.quantity,
       price: item.price,
       image: item.image_url,
+    })),
+    transactions: (transactionsResult?.results || []).map((t) => ({
+      transactionId: t.transaction_id,
+      provider: t.provider,
+      method: t.method,
+      status: t.status,
+      amount: t.amount,
+      externalReference: t.external_reference,
+      metadata: t.metadata ? JSON.parse(t.metadata) : null,
+      createdAt: t.created_at,
+      updatedAt: t.updated_at,
     })),
   };
 }
@@ -220,9 +236,80 @@ export default {
             values.push(phone);
           }
 
-          const query = `SELECT order_number, placed_at, payment_method, total, status FROM orders WHERE ${conditions.join(' OR ')} ORDER BY placed_at DESC LIMIT 25`;
-          const listResult = await env.KOORTA_DB.prepare(query).bind(...values).all();
-          return jsonResponse({ success: true, orders: listResult.results || [] }, 200, corsHeaders);
+          const query = `SELECT * FROM orders WHERE ${conditions.join(' OR ')} ORDER BY placed_at DESC LIMIT 50`;
+          const ordersResult = await env.KOORTA_DB.prepare(query).bind(...values).all();
+          const orders = ordersResult.results || [];
+
+          if (orders.length === 0) {
+            return jsonResponse({ success: true, orders: [] }, 200, corsHeaders);
+          }
+
+          const orderNumbers = orders.map((r) => r.order_number);
+          const placeholders = orderNumbers.map(() => '?').join(',');
+
+          const itemsQuery = `SELECT order_number, item_id, name, size, quantity, price, image_url FROM order_items WHERE order_number IN (${placeholders})`;
+          const itemsResult = await env.KOORTA_DB.prepare(itemsQuery).bind(...orderNumbers).all();
+          const items = itemsResult.results || [];
+
+          const txQuery = `SELECT order_number, transaction_id, provider, method, status, amount, external_reference, metadata, created_at, updated_at FROM transactions WHERE order_number IN (${placeholders})`;
+          const txResult = await env.KOORTA_DB.prepare(txQuery).bind(...orderNumbers).all();
+          const txs = txResult.results || [];
+
+          const itemsByOrder = {};
+          for (const it of items) {
+            (itemsByOrder[it.order_number] ||= []).push({
+              id: it.item_id,
+              name: it.name,
+              size: it.size,
+              qty: it.quantity,
+              price: it.price,
+              image: it.image_url,
+            });
+          }
+
+          const txByOrder = {};
+          for (const t of txs) {
+            (txByOrder[t.order_number] ||= []).push({
+              transactionId: t.transaction_id,
+              provider: t.provider,
+              method: t.method,
+              status: t.status,
+              amount: t.amount,
+              externalReference: t.external_reference,
+              metadata: t.metadata ? JSON.parse(t.metadata) : null,
+              createdAt: t.created_at,
+              updatedAt: t.updated_at,
+            });
+          }
+
+          const assembled = orders.map((orderRow) => ({
+            orderNumber: orderRow.order_number,
+            placedAt: orderRow.placed_at,
+            customer: {
+              name: orderRow.customer_name,
+              email: orderRow.customer_email,
+              phone: orderRow.customer_phone,
+              address: orderRow.customer_address,
+              city: orderRow.customer_city,
+              state: orderRow.customer_state,
+              district: orderRow.customer_district,
+              postOffice: orderRow.customer_post_office,
+              pincode: orderRow.customer_pincode,
+              notes: orderRow.customer_notes,
+            },
+            payment: orderRow.payment_method,
+            upiId: orderRow.upi_id,
+            promoCode: orderRow.promo_code,
+            subtotal: orderRow.subtotal,
+            discount: orderRow.discount,
+            shipping: orderRow.shipping,
+            total: orderRow.total,
+            status: orderRow.status,
+            items: itemsByOrder[orderRow.order_number] || [],
+            transactions: txByOrder[orderRow.order_number] || [],
+          }));
+
+          return jsonResponse({ success: true, orders: assembled }, 200, corsHeaders);
         }
 
         if (method === 'POST') {
