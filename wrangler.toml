@@ -8,3 +8,7 @@ ALLOWED_ORIGIN = "*"
 [[d1_databases]]
 binding = "KOORTA_DB"
 database_name = "koorta_db"
+
+[[r2_buckets]]
+binding = "GARMENT_BUCKET"
+bucket_name = "garment-catalog"

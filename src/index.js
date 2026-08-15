@@ -148,6 +148,18 @@ function calculateShipping(subtotal, promoCode) {
 
 function validatePromoRequest(code, subtotal) {
   const normalized = normalizePromoCode(code);
+  if (!normalized) {
+    const shipping = calculateShipping(Number(subtotal), '');
+    return {
+      valid: true,
+      message: 'No promo code applied.',
+      rule: null,
+      discount: 0,
+      shipping,
+      total: Math.max(0, Number(subtotal) + shipping),
+    };
+  }
+
   const rule = getPromoRule(normalized);
   if (!rule || !rule.active) {
     return { valid: false, message: 'Invalid promo code.' };
@@ -249,6 +261,100 @@ async function getOrder(db, orderNumber) {
   };
 }
 
+async function readCatalog(bucket) {
+  if (!bucket || typeof bucket.get !== 'function') return [];
+
+  const object = await bucket.get('product.json');
+  if (!object) return [];
+
+  const content = await object.text();
+  if (!content) return [];
+
+  try {
+    const parsed = JSON.parse(content);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeCatalog(bucket, products) {
+  if (!bucket || typeof bucket.put !== 'function') return products;
+  await bucket.put('product.json', JSON.stringify(products, null, 2), {
+    cacheControl: 'public, max-age=31536000, immutable',
+  });
+  return products;
+}
+
+async function updateCatalogStockForOrder(bucket, orderItems) {
+  if (!bucket || typeof bucket.get !== 'function') {
+    throw new Error('Catalog bucket is not configured for stock updates.');
+  }
+
+  const catalog = await readCatalog(bucket);
+  if (!Array.isArray(catalog) || catalog.length === 0) {
+    throw new Error('Catalog is empty; stock cannot be decremented.');
+  }
+
+  const catalogById = new Map(catalog.map((product) => [String(product.id), product]));
+  const productUpdates = new Map();
+
+  for (const item of orderItems) {
+    const productId = String(item.itemId || item.id || '').trim();
+    const sizeKey = String(item.size || '').trim();
+    const requestedQty = ensureNumber(item.qty);
+
+    if (!productId || !sizeKey || !requestedQty || requestedQty <= 0) {
+      continue;
+    }
+
+    const product = catalogById.get(productId);
+    if (!product) {
+      throw new Error(`Product ${productId} was not found in the catalog.`);
+    }
+
+    const sizes = Array.isArray(product.sizes) ? product.sizes.map((size) => String(size)) : [];
+    if (sizes.length > 0 && !sizes.includes(sizeKey)) {
+      throw new Error(`Product ${product.name || productId} does not offer size ${sizeKey}.`);
+    }
+
+    const stockBySize = product.stockBySize && typeof product.stockBySize === 'object' && !Array.isArray(product.stockBySize)
+      ? { ...product.stockBySize }
+      : {};
+    const available = Number(stockBySize[sizeKey]);
+
+    if (!Number.isFinite(available) || available < requestedQty) {
+      throw new Error(`Insufficient stock for ${product.name || productId} in size ${sizeKey}. Available: ${Number.isFinite(available) ? available : 0}, requested: ${requestedQty}.`);
+    }
+
+    const updatedProduct = productUpdates.get(productId) || structuredClone(product);
+    const nextStockBySize = updatedProduct.stockBySize && typeof updatedProduct.stockBySize === 'object' && !Array.isArray(updatedProduct.stockBySize)
+      ? { ...updatedProduct.stockBySize }
+      : {};
+    const nextAvailable = Number(nextStockBySize[sizeKey] ?? stockBySize[sizeKey] ?? 0);
+
+    if (!Number.isFinite(nextAvailable) || nextAvailable < requestedQty) {
+      throw new Error(`Insufficient stock for ${updatedProduct.name || productId} in size ${sizeKey}. Available: ${Number.isFinite(nextAvailable) ? nextAvailable : 0}, requested: ${requestedQty}.`);
+    }
+
+    nextStockBySize[sizeKey] = Math.max(0, nextAvailable - requestedQty);
+    updatedProduct.stockBySize = nextStockBySize;
+    productUpdates.set(productId, updatedProduct);
+  }
+
+  if (productUpdates.size === 0) {
+    return;
+  }
+
+  const updatedCatalog = catalog.map((product) => {
+    const id = String(product.id);
+    const updatedProduct = productUpdates.get(id);
+    return updatedProduct || product;
+  });
+
+  await writeCatalog(bucket, updatedCatalog);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -269,6 +375,10 @@ export default {
 
       if (!env.KOORTA_DB) {
         return buildError('D1 binding KOORTA_DB is not configured.', 500, corsHeaders);
+      }
+
+      if (route.startsWith('/orders') && !env.GARMENT_BUCKET) {
+        return buildError('Catalog bucket GARMENT_BUCKET is not configured for stock updates.', 500, corsHeaders);
       }
 
       if (route === '/') {
@@ -508,6 +618,13 @@ export default {
               item.price,
               item.image || null,
             ).run();
+          }
+
+          try {
+            await updateCatalogStockForOrder(env.GARMENT_BUCKET, order.items);
+          } catch (error) {
+            console.error('Catalog stock update failed after order insert:', error);
+            return buildError(error instanceof Error ? error.message : 'Stock update failed.', 409, corsHeaders);
           }
 
           const transactionId = `tx-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
