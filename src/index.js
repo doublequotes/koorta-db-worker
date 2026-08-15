@@ -106,6 +106,72 @@ function normalizeOrderPayload(payload) {
   };
 }
 
+const PROMO_RULES = {
+  KOORTA10: { code: 'KOORTA10', type: 'pct', value: 10, label: '10% off your order', minSubtotal: 0, active: true },
+  FESTIVE15: { code: 'FESTIVE15', type: 'pct', value: 15, label: '15% festive discount', minSubtotal: 4000, active: true },
+  BULK30: { code: 'BULK30', type: 'pct', value: 30, label: '30% bulk order discount', minSubtotal: 12000, active: true },
+  FREESHIP: { code: 'FREESHIP', type: 'shipping', value: 0, label: 'Free shipping', minSubtotal: 1999, active: true },
+};
+
+function normalizePromoCode(code) {
+  return typeof code === 'string' ? code.trim().toUpperCase() : '';
+}
+
+function getPromoRule(code) {
+  const normalized = normalizePromoCode(code);
+  return normalized ? PROMO_RULES[normalized] || null : null;
+}
+
+function calculateDiscount(subtotal, promoCode) {
+  const rule = getPromoRule(promoCode);
+  if (!rule || !rule.active) return 0;
+  if (subtotal < (rule.minSubtotal ?? 0)) return 0;
+
+  if (rule.type === 'pct') {
+    return Math.round((subtotal * rule.value) / 100);
+  }
+
+  if (rule.type === 'flat') {
+    return Math.min(rule.value, subtotal);
+  }
+
+  return 0;
+}
+
+function calculateShipping(subtotal, promoCode) {
+  const rule = getPromoRule(promoCode);
+  if (rule && rule.type === 'shipping' && subtotal >= (rule.minSubtotal ?? 0)) {
+    return 0;
+  }
+  return subtotal > 0 && subtotal < 1999 ? 99 : 0;
+}
+
+function validatePromoRequest(code, subtotal) {
+  const normalized = normalizePromoCode(code);
+  const rule = getPromoRule(normalized);
+  if (!rule || !rule.active) {
+    return { valid: false, message: 'Invalid promo code.' };
+  }
+
+  if (Number(subtotal) < (rule.minSubtotal ?? 0)) {
+    return {
+      valid: false,
+      message: `Requires a subtotal of ₹${(rule.minSubtotal ?? 0).toLocaleString('en-IN')}.`,
+    };
+  }
+
+  const discount = calculateDiscount(Number(subtotal), normalized);
+  const shipping = calculateShipping(Number(subtotal), normalized);
+  return {
+    valid: true,
+    message: `Applied — ${rule.label}.`,
+    rule,
+    discount,
+    shipping,
+    total: Math.max(0, Number(subtotal) - discount + shipping),
+  };
+}
+
 function normalizeRoute(pathname) {
   const cleaned = String(pathname || '').replace(/\/+/g, '/').replace(/\/+$/, '');
   if (cleaned === '') return '/';
@@ -207,6 +273,30 @@ export default {
 
       if (route === '/') {
         return jsonResponse({ success: true, message: 'Koorta DB API is running.' }, 200, corsHeaders);
+      }
+
+      if (route === '/promo/validate') {
+        if (method !== 'POST') {
+          return buildError('Method not allowed.', 405, corsHeaders);
+        }
+
+        const apiKey = request.headers.get('x-koorta-db-api-key') || '';
+        if (!env.KOORTA_DB_WORKER_API_SECRET || apiKey !== env.KOORTA_DB_WORKER_API_SECRET) {
+          return buildError('Unauthorized request.', 401, corsHeaders);
+        }
+
+        const payload = await parseJson(request);
+        if (!payload || typeof payload !== 'object') {
+          return buildError('Request body must be a JSON object.', 400, corsHeaders);
+        }
+
+        const subtotal = ensureNumber(payload.subtotal);
+        if (subtotal === null) {
+          return buildError('Order subtotal is required.', 400, corsHeaders);
+        }
+
+        const validation = validatePromoRequest(payload.code, subtotal);
+        return jsonResponse(validation, 200, corsHeaders);
       }
 
       if (route.startsWith('/orders')) {
@@ -327,6 +417,19 @@ export default {
           const order = normalizeOrderPayload(payload);
           if (!order.orderNumber) {
             return buildError('Order number is required.', 400, corsHeaders);
+          }
+
+          const promoValidation = validatePromoRequest(order.promoCode, order.subtotal);
+          if (!promoValidation.valid) {
+            return buildError(promoValidation.message, 400, corsHeaders);
+          }
+
+          const expectedDiscount = calculateDiscount(order.subtotal, order.promoCode);
+          const expectedShipping = calculateShipping(order.subtotal, order.promoCode);
+          const expectedTotal = Math.max(0, order.subtotal - expectedDiscount + expectedShipping);
+
+          if (Number(order.discount) !== expectedDiscount || Number(order.shipping) !== expectedShipping || Number(order.total) !== expectedTotal) {
+            return buildError('Promo validation failed: totals do not match the approved rule.', 400, corsHeaders);
           }
 
           const existing = await env.KOORTA_DB.prepare('SELECT order_number FROM orders WHERE order_number = ?').bind(order.orderNumber).first();
