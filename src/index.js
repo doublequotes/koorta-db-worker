@@ -35,12 +35,177 @@ function ensureNumber(value) {
   return Number.isFinite(n) ? Math.round(n) : null;
 }
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[character]);
+}
+
+function formatCurrency(amount) {
+  return `₹${Number(amount).toLocaleString('en-IN')}`;
+}
+
+function getOrderEmailContent(order, audience) {
+  const isAdmin = audience === 'admin';
+  const itemRows = order.items.map((item) => `
+    <tr>
+      <td style="padding:14px 12px;border-bottom:1px solid #eee8dc;">${escapeHtml(item.name)}<br><span style="color:#777;font-size:12px;">Size ${escapeHtml(item.size)}</span></td>
+      <td style="padding:14px 12px;border-bottom:1px solid #eee8dc;text-align:center;">${item.qty}</td>
+      <td style="padding:14px 12px;border-bottom:1px solid #eee8dc;text-align:right;">${formatCurrency(item.qty * item.price)}</td>
+    </tr>`).join('');
+  const address = [
+    order.customer.address,
+    `${order.customer.city}, ${order.customer.district}`,
+    `${order.customer.state} ${order.customer.pincode}`,
+    order.customer.postOffice,
+  ].map(escapeHtml).join('<br>');
+  const terms = `
+    <h3 style="margin:24px 0 8px;color:#202947;font-size:14px;">A few helpful details</h3>
+    <ul style="padding-left:20px;color:#625f58;font-size:13px;line-height:1.7;">
+      <li>Every order is reviewed by our team and confirmed before dispatch; payment arrangements are confirmed with you.</li>
+      <li>India delivery typically takes 2–4 working days to metros and 4–6 working days elsewhere.</li>
+      <li>Eligible items may be returned within 15 days of delivery if unworn, unwashed, and with original tags. Reverse pickup and size exchanges are free; refunds are processed within 5 working days. Made-to-measure and altered items cannot be returned. Email hello@koorta.com to start a return.</li>
+    </ul>
+    <p style="font-size:12px;color:#777;">Full details: <a href="https://koorta.com/shipping" style="color:#202947;">Shipping</a> · <a href="https://koorta.com/returns" style="color:#202947;">Returns &amp; Exchanges</a></p>`;
+  const customerDetails = isAdmin
+    ? `<div style="margin-top:20px;padding:16px;border-radius:12px;background:#f8f6f0;">
+        <h3 style="margin:0 0 8px;color:#202947;font-size:14px;">Customer &amp; delivery</h3>
+        <p style="margin:0;color:#3d3b36;font-size:13px;line-height:1.7;">
+          <strong>${escapeHtml(order.customer.name)}</strong><br>
+          ${escapeHtml(order.customer.email || 'No email provided')}<br>
+          ${escapeHtml(order.customer.phone)}<br>${address}
+          ${order.customer.notes ? `<br><strong>Note:</strong> ${escapeHtml(order.customer.notes)}` : ''}
+        </p>
+      </div>`
+    : `<div style="margin-top:20px;padding:16px;border-radius:12px;background:#f8f6f0;">
+        <h3 style="margin:0 0 8px;color:#202947;font-size:14px;">Delivering to</h3>
+        <p style="margin:0;color:#3d3b36;font-size:13px;line-height:1.7;">
+          <strong>${escapeHtml(order.customer.name)}</strong><br>${address}<br>${escapeHtml(order.customer.phone)}
+        </p>
+      </div>`;
+  const textLines = [
+    isAdmin ? `New order ${order.orderNumber}` : `Thank you, ${order.customer.name}! Your order is placed.`,
+    `Order: ${order.orderNumber}`,
+    `Placed: ${new Date(order.placedAt).toLocaleString('en-IN')}`,
+    '',
+    'ORDER DETAILS',
+    ...order.items.map((item) => `${item.name} — Size ${item.size} × ${item.qty}: ${formatCurrency(item.qty * item.price)}`),
+    '',
+    `Subtotal: ${formatCurrency(order.subtotal)}`,
+    ...(order.discount > 0 ? [`Discount${order.promoCode ? ` (${order.promoCode})` : ''}: -${formatCurrency(order.discount)}`] : []),
+    `Shipping: ${order.shipping === 0 ? 'Free' : formatCurrency(order.shipping)}`,
+    `Total: ${formatCurrency(order.total)}`,
+    `Payment: ${order.payment === 'upi' ? 'UPI (confirmation pending)' : 'Discuss & Pay'}`,
+    '',
+    isAdmin ? 'CUSTOMER & DELIVERY' : 'DELIVERY ADDRESS',
+    order.customer.name,
+    ...(isAdmin && order.customer.email ? [order.customer.email] : []),
+    order.customer.phone,
+    order.customer.address,
+    `${order.customer.city}, ${order.customer.district}`,
+    `${order.customer.state} ${order.customer.pincode}`,
+    order.customer.postOffice,
+    ...(order.customer.notes ? [`Note: ${order.customer.notes}`] : []),
+    '',
+    'TERMS & USEFUL INFORMATION',
+    'Your order is reviewed and confirmed by our team before dispatch; payment arrangements are confirmed with you.',
+    'India delivery typically takes 2–4 working days to metros and 4–6 working days elsewhere.',
+    'Eligible items may be returned within 15 days of delivery if unworn, unwashed, and with original tags. Reverse pickup and size exchanges are free; refunds are processed within 5 working days. Made-to-measure and altered items cannot be returned. Email hello@koorta.com to start a return.',
+    'Shipping: https://koorta.com/shipping',
+    'Returns: https://koorta.com/returns',
+  ];
+
+  return {
+    subject: isAdmin
+      ? `New Koorta order ${order.orderNumber.replace(/[\r\n]+/g, ' ')}`
+      : `Your Koorta order is placed — ${order.orderNumber.replace(/[\r\n]+/g, ' ')}`,
+    text: textLines.join('\n'),
+    html: `
+      <div style="margin:0;background:#f5f2eb;padding:28px 12px;font-family:Arial,Helvetica,sans-serif;color:#292821;">
+        <div style="max-width:620px;margin:0 auto;border-radius:18px;overflow:hidden;background:#fff;box-shadow:0 12px 36px rgba(32,41,71,.08);">
+          <div style="padding:30px 28px;background:#202947;color:#fff;">
+            <p style="margin:0 0 10px;color:#d6b978;font-size:11px;font-weight:bold;letter-spacing:3px;">KOORTA · HANDCRAFTED MENSWEAR</p>
+            <h1 style="margin:0;font-family:Georgia,serif;font-size:27px;font-weight:normal;">${isAdmin ? 'A new order has arrived' : `Thank you, ${escapeHtml(order.customer.name)}!`}</h1>
+            <p style="margin:10px 0 0;color:#e3e4eb;font-size:14px;">${isAdmin ? 'Order details for your team' : 'Your order is placed and our team will review it before dispatch.'}</p>
+          </div>
+          <div style="padding:24px 28px;">
+            <div style="display:flex;justify-content:space-between;gap:12px;padding-bottom:16px;border-bottom:1px solid #eee8dc;">
+              <div><span style="display:block;color:#777;font-size:11px;text-transform:uppercase;letter-spacing:1px;">Order number</span><strong style="display:block;margin-top:5px;color:#202947;font-size:18px;">${escapeHtml(order.orderNumber)}</strong></div>
+              <div style="text-align:right;"><span style="display:block;color:#777;font-size:11px;text-transform:uppercase;letter-spacing:1px;">Placed</span><strong style="display:block;margin-top:5px;font-size:13px;">${escapeHtml(new Date(order.placedAt).toLocaleString('en-IN'))}</strong></div>
+            </div>
+            <table role="presentation" style="width:100%;margin-top:12px;border-collapse:collapse;font-size:13px;">
+              <thead><tr style="color:#777;font-size:11px;text-transform:uppercase;letter-spacing:.7px;"><th style="padding:10px 12px;text-align:left;">Piece</th><th style="padding:10px 12px;">Qty</th><th style="padding:10px 12px;text-align:right;">Amount</th></tr></thead>
+              <tbody>${itemRows}</tbody>
+            </table>
+            <div style="max-width:270px;margin:16px 0 0 auto;color:#625f58;font-size:13px;line-height:1.8;">
+              <div style="display:flex;justify-content:space-between;"><span>Subtotal</span><span>${formatCurrency(order.subtotal)}</span></div>
+              ${order.discount > 0 ? `<div style="display:flex;justify-content:space-between;"><span>Discount${order.promoCode ? ` (${escapeHtml(order.promoCode)})` : ''}</span><span>−${formatCurrency(order.discount)}</span></div>` : ''}
+              <div style="display:flex;justify-content:space-between;"><span>Shipping</span><span>${order.shipping === 0 ? 'Free' : formatCurrency(order.shipping)}</span></div>
+              <div style="display:flex;justify-content:space-between;margin-top:8px;padding-top:8px;border-top:1px solid #eee8dc;color:#202947;font-size:16px;font-weight:bold;"><span>Total</span><span>${formatCurrency(order.total)}</span></div>
+              <div style="margin-top:6px;text-align:right;font-size:12px;">Payment: ${order.payment === 'upi' ? 'UPI · confirmation pending' : 'Discuss &amp; Pay'}</div>
+            </div>
+            ${customerDetails}
+            ${terms}
+            <p style="margin:24px 0 0;padding-top:18px;border-top:1px solid #eee8dc;color:#777;font-size:12px;line-height:1.6;">Questions? Reply to this email or contact <a href="mailto:hello@koorta.com" style="color:#202947;">hello@koorta.com</a>.<br>With care, <strong style="color:#202947;">Team Koorta</strong></p>
+          </div>
+        </div>
+      </div>`,
+  };
+}
+
+async function sendResendEmail(env, { to, subject, text, html }) {
+  if (!env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not configured.');
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: env.RESEND_FROM_EMAIL || 'Koorta Orders <orders@koorta.com>',
+      to: [to],
+      subject,
+      text,
+      html,
+    }),
+  });
+  const result = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(`Resend request failed (${response.status}): ${sanitizeString(result?.message) || response.statusText}`);
+  }
+}
+
+async function sendOrderNotifications(order, env) {
+  const recipients = [
+    { role: 'admin', email: 'admin@koorta.com' },
+    ...(order.customer.email ? [{ role: 'customer', email: order.customer.email }] : []),
+  ];
+  const results = await Promise.all(recipients.map(async ({ role, email }) => {
+    try {
+      const content = getOrderEmailContent(order, role);
+      await sendResendEmail(env, { to: email, ...content });
+      return { role, status: 'sent' };
+    } catch (error) {
+      console.error(`Order email delivery failed for ${role} (${order.orderNumber}):`, error);
+      return { role, status: 'failed' };
+    }
+  }));
+  return results;
+}
+
 function validateOrderPayload(payload) {
   if (!payload || typeof payload !== 'object') return 'Request body must be a JSON object.';
 
   const customer = payload.customer || {};
   if (!sanitizeString(customer.name)) return 'Customer name is required.';
-  if (!sanitizeString(customer.email)) return 'Customer email is required.';
+  const customerEmail = sanitizeString(customer.email);
+  if (customerEmail && (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(customerEmail) || customerEmail.length > 255)) {
+    return 'Customer email must be a valid email address.';
+  }
   if (!sanitizeString(customer.phone)) return 'Customer phone is required.';
   if (!sanitizeString(customer.address)) return 'Customer address is required.';
   if (!sanitizeString(customer.city)) return 'Customer city is required.';
@@ -649,7 +814,14 @@ export default {
             return buildError('Failed to persist transaction details.', 500, corsHeaders);
           }
 
-          return jsonResponse({ success: true, orderNumber: order.orderNumber, status: 'pending', transactionId }, 201, corsHeaders);
+          const emailNotifications = await sendOrderNotifications(order, env);
+          return jsonResponse({
+            success: true,
+            orderNumber: order.orderNumber,
+            status: 'pending',
+            transactionId,
+            emailNotifications,
+          }, 201, corsHeaders);
         }
       }
 
