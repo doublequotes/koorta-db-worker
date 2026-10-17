@@ -68,7 +68,7 @@ function getOrderEmailContent(order, audience) {
     <ul style="padding-left:20px;color:#625f58;font-size:13px;line-height:1.7;">
       <li>Every order is reviewed by our team and confirmed before dispatch; payment arrangements are confirmed with you.</li>
       <li>India delivery typically takes 2–4 working days to metros and 4–6 working days elsewhere.</li>
-      <li>Eligible items may be returned within 15 days of delivery if unworn, unwashed, and with original tags. Reverse pickup and size exchanges are free; refunds are processed within 5 working days. Made-to-measure and altered items cannot be returned. Email hello@koorta.com to start a return.</li>
+      <li>Eligible items may be returned within 15 days of delivery if unworn, unwashed, and with original tags. Reverse pickup and size exchanges are free; refunds are processed within 5 working days. Made-to-measure and altered items cannot be returned. Email admin@koorta.com to start a return.</li>
     </ul>
     <p style="font-size:12px;color:#777;">Full details: <a href="https://koorta.com/shipping" style="color:#202947;">Shipping</a> · <a href="https://koorta.com/returns" style="color:#202947;">Returns &amp; Exchanges</a></p>`;
   const customerDetails = isAdmin
@@ -114,7 +114,7 @@ function getOrderEmailContent(order, audience) {
     'TERMS & USEFUL INFORMATION',
     'Your order is reviewed and confirmed by our team before dispatch; payment arrangements are confirmed with you.',
     'India delivery typically takes 2–4 working days to metros and 4–6 working days elsewhere.',
-    'Eligible items may be returned within 15 days of delivery if unworn, unwashed, and with original tags. Reverse pickup and size exchanges are free; refunds are processed within 5 working days. Made-to-measure and altered items cannot be returned. Email hello@koorta.com to start a return.',
+    'Eligible items may be returned within 15 days of delivery if unworn, unwashed, and with original tags. Reverse pickup and size exchanges are free; refunds are processed within 5 working days. Made-to-measure and altered items cannot be returned. Email admin@koorta.com to start a return.',
     'Shipping: https://koorta.com/shipping',
     'Returns: https://koorta.com/returns',
   ];
@@ -150,14 +150,14 @@ function getOrderEmailContent(order, audience) {
             </div>
             ${customerDetails}
             ${terms}
-            <p style="margin:24px 0 0;padding-top:18px;border-top:1px solid #eee8dc;color:#777;font-size:12px;line-height:1.6;">Questions? Reply to this email or contact <a href="mailto:hello@koorta.com" style="color:#202947;">hello@koorta.com</a>.<br>With care, <strong style="color:#202947;">Team Koorta</strong></p>
+            <p style="margin:24px 0 0;padding-top:18px;border-top:1px solid #eee8dc;color:#777;font-size:12px;line-height:1.6;">Questions? Reply to this email or contact <a href="mailto:admin@koorta.com" style="color:#202947;">admin@koorta.com</a>.<br>With care, <strong style="color:#202947;">Team Koorta</strong></p>
           </div>
         </div>
       </div>`,
   };
 }
 
-async function sendResendEmail(env, { to, subject, text, html }) {
+async function sendResendEmail(env, { to, subject, text, html, replyTo }) {
   if (!env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not configured.');
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -171,6 +171,7 @@ async function sendResendEmail(env, { to, subject, text, html }) {
       subject,
       text,
       html,
+      ...(replyTo ? { reply_to: replyTo } : {}),
     }),
   });
   const result = await response.json().catch(() => null);
@@ -538,8 +539,12 @@ export default {
         });
       }
 
-      if (!env.KOORTA_DB) {
+      if (!env.KOORTA_DB && route !== '/contact' && route !== '/wholesale-enquiry') {
         return buildError('D1 binding KOORTA_DB is not configured.', 500, corsHeaders);
+      }
+
+      if (route === '/wholesale-enquiry' && !env.GARMENT_BUCKET) {
+        return buildError('Catalog bucket GARMENT_BUCKET is not configured.', 500, corsHeaders);
       }
 
       if (route.startsWith('/orders') && !env.GARMENT_BUCKET) {
@@ -572,6 +577,239 @@ export default {
 
         const validation = validatePromoRequest(payload.code, subtotal);
         return jsonResponse(validation, 200, corsHeaders);
+      }
+
+      if (route === '/contact') {
+        if (method !== 'POST') {
+          return buildError('Method not allowed.', 405, corsHeaders);
+        }
+
+        const apiKey = request.headers.get('x-koorta-db-api-key') || '';
+        if (!env.KOORTA_DB_WORKER_API_SECRET || apiKey !== env.KOORTA_DB_WORKER_API_SECRET) {
+          return buildError('Unauthorized request.', 401, corsHeaders);
+        }
+
+        const payload = await parseJson(request);
+        if (!payload || typeof payload !== 'object') {
+          return buildError('Request body must be a JSON object.', 400, corsHeaders);
+        }
+
+        const name = sanitizeString(payload.name);
+        const email = sanitizeString(payload.email);
+        const message = sanitizeString(payload.message);
+        if (!name || name.length > 100) {
+          return buildError('Name is required and must be 100 characters or fewer.', 400, corsHeaders);
+        }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || email.length > 255) {
+          return buildError('Enter a valid email address.', 400, corsHeaders);
+        }
+        if (!message || message.length > 5000) {
+          return buildError('Message is required and must be 5000 characters or fewer.', 400, corsHeaders);
+        }
+
+        const safeName = name.replace(/[\r\n]+/g, ' ');
+        const safeEmail = email.replace(/[\r\n]+/g, '');
+        const safeMessage = escapeHtml(message).replace(/\r?\n/g, '<br>');
+        const subject = `Website enquiry from ${safeName}`;
+        const text = `New contact enquiry from koorta.com\n\nName: ${name}\nEmail: ${email}\n\nMessage:\n${message}`;
+        const html = `
+          <div style="margin:0;background:#f5f2eb;padding:28px 12px;font-family:Arial,Helvetica,sans-serif;color:#292821;">
+            <div style="max-width:620px;margin:0 auto;border-radius:18px;overflow:hidden;background:#fff;box-shadow:0 12px 36px rgba(32,41,71,.08);">
+              <div style="padding:26px 28px;background:#202947;color:#fff;">
+                <p style="margin:0 0 10px;color:#d6b978;font-size:11px;font-weight:bold;letter-spacing:3px;">KOORTA · WEBSITE ENQUIRY</p>
+                <h1 style="margin:0;font-family:Georgia,serif;font-size:26px;font-weight:normal;">A customer has reached out</h1>
+              </div>
+              <div style="padding:24px 28px;">
+                <p style="margin:0;color:#625f58;font-size:13px;line-height:1.7;">You have received a new enquiry through the contact page.</p>
+                <div style="margin-top:18px;padding:16px;border-radius:12px;background:#f8f6f0;font-size:14px;line-height:1.8;">
+                  <strong style="color:#202947;">${escapeHtml(name)}</strong><br>
+                  <a href="mailto:${escapeHtml(safeEmail)}" style="color:#202947;">${escapeHtml(email)}</a>
+                </div>
+                <div style="margin-top:18px;padding:18px;border:1px solid #eee8dc;border-radius:12px;font-size:14px;line-height:1.8;">${safeMessage}</div>
+              </div>
+            </div>
+          </div>`;
+
+        try {
+          await sendResendEmail(env, {
+            to: 'admin@koorta.com',
+            replyTo: safeEmail,
+            subject,
+            text,
+            html,
+          });
+        } catch (error) {
+          console.error('Contact enquiry email delivery failed:', error);
+          return buildError('Unable to send your message right now. Please try again later.', 502, corsHeaders);
+        }
+
+        return jsonResponse({ success: true }, 200, corsHeaders);
+      }
+
+      if (route === '/wholesale-enquiry') {
+        if (method !== 'POST') {
+          return buildError('Method not allowed.', 405, corsHeaders);
+        }
+
+        const apiKey = request.headers.get('x-koorta-db-api-key') || '';
+        if (!env.KOORTA_DB_WORKER_API_SECRET || apiKey !== env.KOORTA_DB_WORKER_API_SECRET) {
+          return buildError('Unauthorized request.', 401, corsHeaders);
+        }
+
+        const payload = await parseJson(request);
+        if (!payload || typeof payload !== 'object') {
+          return buildError('Request body must be a JSON object.', 400, corsHeaders);
+        }
+
+        const businessName = sanitizeString(payload.businessName);
+        const contactName = sanitizeString(payload.contactName);
+        const email = sanitizeString(payload.email);
+        const phone = sanitizeString(payload.phone);
+        const category = sanitizeString(payload.category);
+        const deliveryDate = sanitizeString(payload.deliveryDate);
+        const notes = sanitizeString(payload.notes);
+        if (!businessName || businessName.length > 150) {
+          return buildError('Business name is required and must be 150 characters or fewer.', 400, corsHeaders);
+        }
+        if (!contactName || contactName.length > 100) {
+          return buildError('Contact name is required and must be 100 characters or fewer.', 400, corsHeaders);
+        }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || email.length > 255) {
+          return buildError('Enter a valid email address.', 400, corsHeaders);
+        }
+        if (!phone || phone.length > 30) {
+          return buildError('Phone number is required and must be 30 characters or fewer.', 400, corsHeaders);
+        }
+        if (!category || category.length > 80) {
+          return buildError('Category of interest is required.', 400, corsHeaders);
+        }
+        const parsedDeliveryDate = new Date(`${deliveryDate}T00:00:00Z`);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(deliveryDate) || !Number.isFinite(parsedDeliveryDate.getTime()) || parsedDeliveryDate.toISOString().slice(0, 10) !== deliveryDate) {
+          return buildError('Enter a valid expected delivery date.', 400, corsHeaders);
+        }
+        const earliestDate = new Date();
+        earliestDate.setUTCHours(0, 0, 0, 0);
+        earliestDate.setUTCDate(earliestDate.getUTCDate() + 7);
+        if (deliveryDate < earliestDate.toISOString().slice(0, 10)) {
+          return buildError('Expected delivery date must be at least 7 days from today.', 400, corsHeaders);
+        }
+        if (notes.length > 2000) {
+          return buildError('Notes must be 2000 characters or fewer.', 400, corsHeaders);
+        }
+        if (!Array.isArray(payload.products) || payload.products.length === 0 || payload.products.length > 100) {
+          return buildError('Select between 1 and 100 products for the enquiry.', 400, corsHeaders);
+        }
+
+        const catalog = await readCatalog(env.GARMENT_BUCKET);
+        const catalogById = new Map(catalog.map((product) => [String(product.id), product]));
+        const enquiryProducts = [];
+        const seenProductIds = new Set();
+        for (const requestedProduct of payload.products) {
+          const id = sanitizeString(requestedProduct?.id);
+          const quantity = Number(requestedProduct?.quantity);
+          if (!id || seenProductIds.has(id)) {
+            return buildError('Each selected product must have a unique catalog ID.', 400, corsHeaders);
+          }
+          if (!Number.isInteger(quantity) || quantity < 10 || quantity > 9999) {
+            return buildError('Each selected product quantity must be a whole number between 10 and 9999.', 400, corsHeaders);
+          }
+          const product = catalogById.get(id);
+          if (!product) {
+            return buildError(`Product ${id} is no longer in the live catalog. Please reload the page and try again.`, 400, corsHeaders);
+          }
+          const unitPrice = Number(product.price);
+          if (!Number.isFinite(unitPrice) || unitPrice < 0) {
+            return buildError(`Product ${id} has an invalid catalog price.`, 500, corsHeaders);
+          }
+          seenProductIds.add(id);
+          enquiryProducts.push({
+            id,
+            name: sanitizeString(product.name),
+            category: sanitizeString(product.category),
+            quantity,
+            unitPrice,
+            sizes: Array.isArray(product.sizes) ? product.sizes.map((size) => sanitizeString(size)).filter(Boolean) : [],
+          });
+        }
+
+        const totalQuantity = enquiryProducts.reduce((total, product) => total + product.quantity, 0);
+        const estimatedValue = enquiryProducts.reduce((total, product) => total + product.quantity * product.unitPrice, 0);
+        const safeBusinessName = businessName.replace(/[\r\n]+/g, ' ');
+        const safeContactName = contactName.replace(/[\r\n]+/g, ' ');
+        const safeEmail = email.replace(/[\r\n]+/g, '');
+        const productsText = enquiryProducts.map((product) =>
+          `- ${product.name} (${product.category}) [${product.id}] — Qty: ${product.quantity}; Unit price: ${formatCurrency(product.unitPrice)}; Indicative line value: ${formatCurrency(product.quantity * product.unitPrice)}; Sizes: ${product.sizes.join(', ') || 'Not specified'}`,
+        );
+        const productsHtml = enquiryProducts.map((product) => `
+          <tr>
+            <td style="padding:12px;border-bottom:1px solid #eee8dc;">${escapeHtml(product.name)}<br><span style="font-size:12px;color:#777;">${escapeHtml(product.category)} · ${escapeHtml(product.id)}<br>Sizes: ${escapeHtml(product.sizes.join(', ') || 'Not specified')}</span></td>
+            <td style="padding:12px;border-bottom:1px solid #eee8dc;text-align:center;">${product.quantity}</td>
+            <td style="padding:12px;border-bottom:1px solid #eee8dc;text-align:right;">${formatCurrency(product.unitPrice)}</td>
+            <td style="padding:12px;border-bottom:1px solid #eee8dc;text-align:right;">${formatCurrency(product.quantity * product.unitPrice)}</td>
+          </tr>`).join('');
+        const subject = `Wholesale enquiry from ${safeBusinessName}`;
+        const text = [
+          'New wholesale enquiry from koorta.com',
+          '',
+          `Business / Buyer: ${businessName}`,
+          `Contact person: ${contactName}`,
+          `Email: ${email}`,
+          `Phone: ${phone}`,
+          `Category of interest: ${category}`,
+          `Expected delivery date: ${deliveryDate}`,
+          '',
+          'SELECTED PRODUCTS',
+          ...productsText,
+          '',
+          `Total quantity: ${totalQuantity}`,
+          `Indicative value: ${formatCurrency(estimatedValue)} (before wholesale discount)`,
+          '',
+          'NOTES',
+          notes || 'None provided',
+        ].join('\n');
+        const html = `
+          <div style="margin:0;background:#f5f2eb;padding:28px 12px;font-family:Arial,Helvetica,sans-serif;color:#292821;">
+            <div style="max-width:720px;margin:0 auto;border-radius:18px;overflow:hidden;background:#fff;box-shadow:0 12px 36px rgba(32,41,71,.08);">
+              <div style="padding:26px 28px;background:#202947;color:#fff;">
+                <p style="margin:0 0 10px;color:#d6b978;font-size:11px;font-weight:bold;letter-spacing:3px;">KOORTA · WHOLESALE ENQUIRY</p>
+                <h1 style="margin:0;font-family:Georgia,serif;font-size:26px;font-weight:normal;">A bulk buyer is interested</h1>
+              </div>
+              <div style="padding:24px 28px;">
+                <h2 style="margin:0 0 10px;color:#202947;font-size:16px;">Buyer details</h2>
+                <table role="presentation" style="width:100%;border-collapse:collapse;font-size:13px;line-height:1.7;">
+                  <tr><td style="padding:4px 0;color:#777;">Business</td><td style="padding:4px 0;"><strong>${escapeHtml(businessName)}</strong></td></tr>
+                  <tr><td style="padding:4px 0;color:#777;">Contact person</td><td style="padding:4px 0;">${escapeHtml(contactName)}</td></tr>
+                  <tr><td style="padding:4px 0;color:#777;">Email</td><td style="padding:4px 0;"><a href="mailto:${escapeHtml(safeEmail)}" style="color:#202947;">${escapeHtml(email)}</a></td></tr>
+                  <tr><td style="padding:4px 0;color:#777;">Phone / WhatsApp</td><td style="padding:4px 0;">${escapeHtml(phone)}</td></tr>
+                  <tr><td style="padding:4px 0;color:#777;">Category</td><td style="padding:4px 0;">${escapeHtml(category)}</td></tr>
+                  <tr><td style="padding:4px 0;color:#777;">Expected delivery</td><td style="padding:4px 0;">${escapeHtml(deliveryDate)}</td></tr>
+                </table>
+                <h2 style="margin:24px 0 8px;color:#202947;font-size:16px;">Requested products</h2>
+                <table role="presentation" style="width:100%;border-collapse:collapse;font-size:12px;">
+                  <thead><tr style="color:#777;text-transform:uppercase;letter-spacing:.5px;"><th style="padding:10px 12px;text-align:left;">Product</th><th style="padding:10px 12px;">Qty</th><th style="padding:10px 12px;text-align:right;">Unit price</th><th style="padding:10px 12px;text-align:right;">Est. value</th></tr></thead>
+                  <tbody>${productsHtml}</tbody>
+                </table>
+                <p style="margin:14px 0 0;text-align:right;font-size:14px;line-height:1.8;"><strong>${totalQuantity}</strong> pieces · Indicative value: <strong>${formatCurrency(estimatedValue)}</strong><br><span style="font-size:11px;color:#777;">Before wholesale discount; confirm final pricing with buyer.</span></p>
+                <h2 style="margin:22px 0 8px;color:#202947;font-size:16px;">Notes</h2>
+                <div style="padding:16px;border:1px solid #eee8dc;border-radius:12px;font-size:13px;line-height:1.7;">${notes ? escapeHtml(notes).replace(/\r?\n/g, '<br>') : 'None provided'}</div>
+              </div>
+            </div>
+          </div>`;
+
+        try {
+          await sendResendEmail(env, {
+            to: 'admin@koorta.com',
+            replyTo: safeEmail,
+            subject,
+            text,
+            html,
+          });
+        } catch (error) {
+          console.error('Wholesale enquiry email delivery failed:', error);
+          return buildError('Unable to send your enquiry right now. Please try again later.', 502, corsHeaders);
+        }
+
+        return jsonResponse({ success: true }, 200, corsHeaders);
       }
 
       if (route.startsWith('/orders')) {
