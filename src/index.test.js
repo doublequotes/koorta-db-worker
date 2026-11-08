@@ -31,10 +31,10 @@ test("enforces the trusted 15-day delivery return window", () => {
 
 test("allows credentialed CORS only from configured admin UI origins", () => {
   const env = { ADMIN_UI_ORIGINS: "https://koorta.com,https://www.koorta.com" };
-  const allowedRequest = new Request("https://orders.koorta.com/admin/orders", {
+  const allowedRequest = new Request("https://db.koorta.com/admin/orders", {
     headers: { origin: "https://koorta.com" },
   });
-  const blockedRequest = new Request("https://orders.koorta.com/admin/orders", {
+  const blockedRequest = new Request("https://db.koorta.com/admin/orders", {
     headers: { origin: "https://untrusted.example" },
   });
 
@@ -132,7 +132,7 @@ test("validates Cloudflare Access JWT signature, issuer, audience, and identity"
       new TextEncoder().encode(signingInput),
     );
     const token = `${signingInput}.${Buffer.from(signature).toString("base64url")}`;
-    const request = new Request("https://orders.koorta.com/admin/orders", {
+    const request = new Request("https://db.koorta.com/admin/orders", {
       headers: { "cf-access-jwt-assertion": token },
     });
     const env = {
@@ -141,7 +141,7 @@ test("validates Cloudflare Access JWT signature, issuer, audience, and identity"
     };
 
     assert.equal(await verifyCloudflareAccess(request, env), "admin@koorta.com");
-    const invalidRequest = new Request("https://orders.koorta.com/admin/orders", {
+    const invalidRequest = new Request("https://db.koorta.com/admin/orders", {
       headers: {
         "cf-access-jwt-assertion": `${header}.${Buffer.from(JSON.stringify({ ...claims, aud: ["wrong"] })).toString("base64url")}.${Buffer.from(signature).toString("base64url")}`,
       },
@@ -154,7 +154,7 @@ test("validates Cloudflare Access JWT signature, issuer, audience, and identity"
 
 test("reports missing Cloudflare Access configuration for admin routes", async () => {
   const response = await worker.fetch(
-    new Request("https://orders.koorta.com/admin/orders"),
+    new Request("https://db.koorta.com/admin/orders"),
     { ADMIN_UI_ORIGINS: "https://koorta.com" },
   );
   assert.equal(response.status, 503);
@@ -178,7 +178,7 @@ test("verifies Turnstile action and allowed hostname server-side", async () => {
   };
 
   try {
-    const request = new Request("https://orders.koorta.com/customer/order-lookup", {
+    const request = new Request("https://db.koorta.com/customer/order-lookup", {
       headers: { "cf-connecting-ip": "192.0.2.1" },
     });
     const env = {
@@ -412,7 +412,7 @@ test("handles a discounted partial return through approval, restock, and refund"
 
   try {
     const lookupResponse = await worker.fetch(
-      new Request("https://orders.koorta.com/customer/order-lookup", {
+      new Request("https://db.koorta.com/customer/order-lookup", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -429,7 +429,7 @@ test("handles a discounted partial return through approval, restock, and refund"
     assert.equal(lookup.order.items[0].returnableQty, 1);
 
     const requestResponse = await worker.fetch(
-      new Request("https://orders.koorta.com/customer/orders/ORD-1/requests", {
+      new Request("https://db.koorta.com/customer/orders/ORD-1/requests", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -452,7 +452,7 @@ test("handles a discounted partial return through approval, restock, and refund"
     assert.equal(ledger.amount, -720);
     assert.equal(JSON.parse(ledger.metadata).discountAllocated, 80);
 
-    const requestEndpoint = `https://orders.koorta.com/admin/orders/ORD-1/requests/${requested.transactionId}`;
+    const requestEndpoint = `https://db.koorta.com/admin/orders/ORD-1/requests/${requested.transactionId}`;
     const approveResponse = await worker.fetch(
       new Request(requestEndpoint, {
         method: "POST",
@@ -497,7 +497,7 @@ test("handles a discounted partial return through approval, restock, and refund"
     );
 
     const secondRequestResponse = await worker.fetch(
-      new Request("https://orders.koorta.com/customer/orders/ORD-1/requests", {
+      new Request("https://db.koorta.com/customer/orders/ORD-1/requests", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -514,7 +514,7 @@ test("handles a discounted partial return through approval, restock, and refund"
     assert.equal(secondRequestResponse.status, 201);
     const secondRequest = await secondRequestResponse.json();
     assert.equal(secondRequest.estimatedRefund, 1080);
-    const secondEndpoint = `https://orders.koorta.com/admin/orders/ORD-1/requests/${secondRequest.transactionId}`;
+    const secondEndpoint = `https://db.koorta.com/admin/orders/ORD-1/requests/${secondRequest.transactionId}`;
     for (const action of ["approve", "receive"]) {
       const response = await worker.fetch(
         new Request(secondEndpoint, {
@@ -550,7 +550,7 @@ test("handles a discounted partial return through approval, restock, and refund"
     );
 
     const duplicateResponse = await worker.fetch(
-      new Request("https://orders.koorta.com/customer/orders/ORD-1/requests", {
+      new Request("https://db.koorta.com/customer/orders/ORD-1/requests", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -567,7 +567,7 @@ test("handles a discounted partial return through approval, restock, and refund"
     assert.equal(duplicateResponse.status, 409);
 
     const unauthorized = await worker.fetch(
-      new Request("https://orders.koorta.com/orders/ORD-1"),
+      new Request("https://db.koorta.com/orders/ORD-1"),
       env,
     );
     assert.equal(unauthorized.status, 401);
@@ -621,7 +621,7 @@ test("cancels an unpaid order without creating a refund transaction", async () =
 
   try {
     const requestResponse = await worker.fetch(
-      new Request("https://orders.koorta.com/customer/orders/ORD-1/requests", {
+      new Request("https://db.koorta.com/customer/orders/ORD-1/requests", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -648,7 +648,7 @@ test("cancels an unpaid order without creating a refund transaction", async () =
     };
     const approveResponse = await worker.fetch(
       new Request(
-        `https://orders.koorta.com/admin/orders/ORD-1/requests/${requestResult.transactionId}`,
+        `https://db.koorta.com/admin/orders/ORD-1/requests/${requestResult.transactionId}`,
         {
           method: "POST",
           headers: {
