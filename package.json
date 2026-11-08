@@ -2,9 +2,11 @@
   "name": "koorta-db-worker",
   "private": true,
   "version": "1.0.0",
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "node --test"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

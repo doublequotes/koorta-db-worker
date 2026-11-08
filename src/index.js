@@ -198,6 +198,63 @@ async function sendOrderNotifications(order, env) {
   return results;
 }
 
+async function sendOrderLifecycleNotifications(order, env, event) {
+  const safeEvent = escapeHtml(event.title);
+  const recipients = [
+    { role: 'admin', email: 'admin@koorta.com' },
+    ...(order.customer.email ? [{ role: 'customer', email: order.customer.email }] : []),
+  ];
+  const items = (event.items || []).map((item) => `${item.name} — Size ${item.size} × ${item.qty}`);
+  const results = await Promise.all(recipients.map(async ({ role, email }) => {
+    const text = [
+      role === 'admin' ? event.title : `Hello ${order.customer.name},`,
+      event.message,
+      `Order: ${order.orderNumber}`,
+      ...(role === 'admin' ? [`Customer: ${order.customer.name} (${order.customer.phone})`, ...(order.customer.email ? [`Email: ${order.customer.email}`] : [])] : []),
+      ...(event.amount !== undefined ? [`${event.amount < 0 ? 'Refund' : 'Amount'}: ${formatCurrency(Math.abs(event.amount))}`] : []),
+      ...(event.reference ? [`Reference: ${event.reference}`] : []),
+      ...(event.reason ? [`Reason: ${event.reason}`] : []),
+      ...(items.length ? ['', 'Items:', ...items] : []),
+      '',
+      `Original order total: ${formatCurrency(order.total)}`,
+      'For help, contact admin@koorta.com.',
+    ].join('\n');
+    const html = `
+      <div style="margin:0;background:#f5f2eb;padding:28px 12px;font-family:Arial,Helvetica,sans-serif;color:#292821;">
+        <div style="max-width:620px;margin:0 auto;border-radius:18px;overflow:hidden;background:#fff;">
+          <div style="padding:26px 28px;background:#202947;color:#fff;">
+            <p style="margin:0 0 10px;color:#d6b978;font-size:11px;font-weight:bold;letter-spacing:3px;">KOORTA · ORDER UPDATE</p>
+            <h1 style="margin:0;font-family:Georgia,serif;font-size:25px;font-weight:normal;">${safeEvent}</h1>
+          </div>
+          <div style="padding:24px 28px;font-size:14px;line-height:1.8;">
+            <p>${escapeHtml(role === 'admin' ? event.message : `Hello ${order.customer.name}, ${event.message}`)}</p>
+            <p><strong>Order:</strong> ${escapeHtml(order.orderNumber)}</p>
+            ${role === 'admin' ? `<p><strong>Customer:</strong> ${escapeHtml(order.customer.name)} · ${escapeHtml(order.customer.phone)}${order.customer.email ? ` · ${escapeHtml(order.customer.email)}` : ''}</p>` : ''}
+            ${event.amount !== undefined ? `<p><strong>${event.amount < 0 ? 'Refund' : 'Amount'}:</strong> ${formatCurrency(Math.abs(event.amount))}</p>` : ''}
+            ${event.reference ? `<p><strong>Reference:</strong> ${escapeHtml(event.reference)}</p>` : ''}
+            ${event.reason ? `<p><strong>Reason:</strong> ${escapeHtml(event.reason)}</p>` : ''}
+            ${items.length ? `<p><strong>Items:</strong><br>${items.map(escapeHtml).join('<br>')}</p>` : ''}
+            <p><strong>Original order total:</strong> ${formatCurrency(order.total)}</p>
+            <p style="padding-top:16px;border-top:1px solid #eee8dc;color:#777;font-size:12px;">Questions? Contact <a href="mailto:admin@koorta.com" style="color:#202947;">admin@koorta.com</a>.<br>With care, <strong style="color:#202947;">Team Koorta</strong></p>
+          </div>
+        </div>
+      </div>`;
+    try {
+      await sendResendEmail(env, {
+        to: email,
+        subject: `${event.title} — ${order.orderNumber.replace(/[\r\n]+/g, ' ')}`,
+        text,
+        html,
+      });
+      return { role, status: 'sent' };
+    } catch (error) {
+      console.error(`Order update email delivery failed for ${role} (${order.orderNumber}):`, error);
+      return { role, status: 'failed' };
+    }
+  }));
+  return results;
+}
+
 function validateOrderPayload(payload) {
   if (!payload || typeof payload !== 'object') return 'Request body must be a JSON object.';
 
@@ -356,12 +413,186 @@ function normalizeRoute(pathname) {
   return cleaned;
 }
 
-function getCorsHeaders(env) {
-  return {
-    'Access-Control-Allow-Origin': String(env.ALLOWED_ORIGIN || '*'),
+function getCorsHeaders(env, request, allowCredentials = false) {
+  const origin = request?.headers.get('origin') || '';
+  const allowedOrigins = String(env.ADMIN_UI_ORIGINS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const originAllowed = origin && allowedOrigins.includes(origin);
+  const headers = {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-Koorta-Db-Api-Key',
+    'Vary': 'Origin',
   };
+  if (originAllowed) {
+    headers['Access-Control-Allow-Origin'] = origin;
+    if (allowCredentials) headers['Access-Control-Allow-Credentials'] = 'true';
+  }
+  return headers;
+}
+
+function decodeBase64Url(value) {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+  return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+}
+
+let accessJwksCache = { issuer: '', expiresAt: 0, keys: [] };
+
+function hasCloudflareAccessConfig(env) {
+  const issuer = String(env.ACCESS_ISSUER || '').trim().replace(/\/+$/, '');
+  const audiences = String(env.ACCESS_AUD || '').split(',').map((value) => value.trim()).filter(Boolean);
+  return /^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/i.test(issuer) && audiences.length > 0;
+}
+
+async function getAccessJwks(env, forceRefresh = false) {
+  const issuer = String(env.ACCESS_ISSUER || '').trim().replace(/\/+$/, '');
+  if (!/^https:\/\/[a-z0-9-]+\.cloudflareaccess\.com$/i.test(issuer)) {
+    throw new Error('ACCESS_ISSUER is not configured with a valid Cloudflare Access team URL.');
+  }
+  if (!forceRefresh && accessJwksCache.issuer === issuer && accessJwksCache.expiresAt > Date.now()) {
+    return accessJwksCache.keys;
+  }
+
+  const response = await fetch(`${issuer}/cdn-cgi/access/certs`);
+  if (!response.ok) throw new Error(`Cloudflare Access JWKS request failed (${response.status}).`);
+  const jwks = await response.json();
+  if (!Array.isArray(jwks?.keys) || jwks.keys.length === 0) throw new Error('Cloudflare Access returned no signing keys.');
+  accessJwksCache = { issuer, expiresAt: Date.now() + 10 * 60 * 1000, keys: jwks.keys };
+  return accessJwksCache.keys;
+}
+
+async function verifyCloudflareAccess(request, env) {
+  const token = request.headers.get('cf-access-jwt-assertion') || '';
+  const audiences = String(env.ACCESS_AUD || '').split(',').map((value) => value.trim()).filter(Boolean);
+  const issuer = String(env.ACCESS_ISSUER || '').trim().replace(/\/+$/, '');
+  if (!token || !hasCloudflareAccessConfig(env)) return false;
+
+  try {
+    const [encodedHeader, encodedPayload, encodedSignature] = token.split('.');
+    if (!encodedHeader || !encodedPayload || !encodedSignature) return false;
+    const header = JSON.parse(new TextDecoder().decode(decodeBase64Url(encodedHeader)));
+    const claims = JSON.parse(new TextDecoder().decode(decodeBase64Url(encodedPayload)));
+    const tokenAudiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+    const now = Math.floor(Date.now() / 1000);
+    if (
+      !['RS256', 'ES256'].includes(header.alg)
+      || !header.kid
+      || claims.iss !== issuer
+      || !tokenAudiences.some((audience) => audiences.includes(audience))
+      || !Number.isFinite(claims.exp)
+      || claims.exp <= now
+      || (Number.isFinite(claims.nbf) && claims.nbf > now)
+    ) return false;
+
+    let jwk = (await getAccessJwks(env)).find((key) => key.kid === header.kid);
+    if (!jwk) jwk = (await getAccessJwks(env, true)).find((key) => key.kid === header.kid);
+    if (!jwk) return false;
+    const rsa = header.alg === 'RS256';
+    const algorithm = rsa
+      ? { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }
+      : { name: 'ECDSA', namedCurve: 'P-256' };
+    const key = await crypto.subtle.importKey('jwk', jwk, algorithm, false, ['verify']);
+    const signatureAlgorithm = rsa
+      ? { name: 'RSASSA-PKCS1-v1_5' }
+      : { name: 'ECDSA', hash: 'SHA-256' };
+    const verified = await crypto.subtle.verify(
+      signatureAlgorithm,
+      key,
+      decodeBase64Url(encodedSignature),
+      new TextEncoder().encode(`${encodedHeader}.${encodedPayload}`),
+    );
+    if (!verified) return false;
+
+    const email = String(claims.email || '').trim().toLowerCase();
+    return email || false;
+  } catch (error) {
+    console.error('Cloudflare Access token validation failed:', error);
+    return false;
+  }
+}
+
+async function verifyTurnstile(request, token, env, expectedAction) {
+  if (!env.TURNSTILE_SECRET_KEY) throw new Error('TURNSTILE_SECRET_KEY is not configured.');
+  if (typeof token !== 'string' || token.length < 1 || token.length > 2048) return false;
+
+  const body = new URLSearchParams({
+    secret: env.TURNSTILE_SECRET_KEY,
+    response: token,
+  });
+  const remoteIp = request.headers.get('cf-connecting-ip');
+  if (remoteIp) body.set('remoteip', remoteIp);
+
+  const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  if (!response.ok) throw new Error(`Turnstile verification request failed (${response.status}).`);
+  const result = await response.json();
+  if (!result.success || result.action !== expectedAction) return false;
+  const allowedHostnames = String(env.TURNSTILE_HOSTNAMES || '')
+    .split(',')
+    .map((hostname) => hostname.trim().toLowerCase())
+    .filter(Boolean);
+  return allowedHostnames.length === 0 || allowedHostnames.includes(String(result.hostname || '').toLowerCase());
+}
+
+function normalizePhone(value) {
+  const digits = String(value || '').replace(/\D/g, '');
+  return digits.length >= 10 ? digits.slice(-10) : digits;
+}
+
+function parseTransactionMetadata(value) {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function newTransactionId(prefix) {
+  return `${prefix}-${crypto.randomUUID()}`;
+}
+
+async function findCustomerOrder(db, orderNumber, phone) {
+  const order = await db.prepare('SELECT * FROM orders WHERE order_number = ?').bind(orderNumber).first();
+  const providedPhone = normalizePhone(phone);
+  if (!order || providedPhone.length !== 10 || normalizePhone(order.customer_phone) !== providedPhone) return null;
+  return order;
+}
+
+function isWithinReturnWindow(deliveredAt, now = Date.now()) {
+  const delivered = Date.parse(deliveredAt || '');
+  return Number.isFinite(delivered) && now >= delivered && now <= delivered + 15 * 24 * 60 * 60 * 1000;
+}
+
+function requestedItemKey(itemId, size) {
+  return `${itemId}\u0000${size}`;
+}
+
+function collectReservedReturnQuantities(transactions) {
+  const reserved = new Map();
+  const activeStatuses = new Set([
+    'return_requested',
+    'approved',
+    'processing',
+    'inventory_review_required',
+    'refund_pending',
+    'refunded',
+  ]);
+  for (const transaction of transactions) {
+    const metadata = parseTransactionMetadata(transaction.metadata);
+    if (metadata.type !== 'return' || !activeStatuses.has(transaction.status)) continue;
+    for (const item of Array.isArray(metadata.items) ? metadata.items : []) {
+      const key = requestedItemKey(String(item.itemId), String(item.size));
+      reserved.set(key, (reserved.get(key) || 0) + Number(item.qty || 0));
+    }
+  }
+  return reserved;
 }
 
 async function getOrder(db, orderNumber) {
@@ -405,6 +636,7 @@ async function getOrder(db, orderNumber) {
     shipping: orderResult.shipping,
     total: orderResult.total,
     status: orderResult.status,
+    deliveredAt: orderResult.delivered_at || null,
     items: (itemsResult?.results || []).map((item) => ({
       id: item.item_id,
       name: item.name,
@@ -420,7 +652,7 @@ async function getOrder(db, orderNumber) {
       status: t.status,
       amount: t.amount,
       externalReference: t.external_reference,
-      metadata: t.metadata ? JSON.parse(t.metadata) : null,
+      metadata: parseTransactionMetadata(t.metadata),
       createdAt: t.created_at,
       updatedAt: t.updated_at,
     })),
@@ -521,12 +753,69 @@ async function updateCatalogStockForOrder(bucket, orderItems) {
   await writeCatalog(bucket, updatedCatalog);
 }
 
+async function restoreCatalogStockForOrder(bucket, orderItems, adjustmentId) {
+  if (!bucket || typeof bucket.get !== 'function') {
+    throw new Error('Catalog bucket is not configured for stock restoration.');
+  }
+  if (!adjustmentId) throw new Error('Stock restoration requires an adjustment ID.');
+
+  const catalog = await readCatalog(bucket);
+  if (!Array.isArray(catalog) || catalog.length === 0) {
+    throw new Error('Catalog is empty; stock cannot be restored.');
+  }
+
+  const itemsByProduct = new Map();
+  for (const item of orderItems) {
+    const productId = String(item.itemId || item.id || '').trim();
+    const size = String(item.size || '').trim();
+    const qty = ensureNumber(item.qty);
+    if (!productId || !size || !qty || qty <= 0) {
+      throw new Error('Stock restoration contains an invalid order item.');
+    }
+    const items = itemsByProduct.get(productId) || [];
+    items.push({ size, qty });
+    itemsByProduct.set(productId, items);
+  }
+
+  const catalogById = new Map(catalog.map((product) => [String(product.id), product]));
+  const productUpdates = new Map();
+  for (const [productId, items] of itemsByProduct) {
+    const product = catalogById.get(productId);
+    if (!product) throw new Error(`Product ${productId} was not found in the catalog.`);
+    const appliedIds = Array.isArray(product.inventoryAdjustmentIds)
+      ? product.inventoryAdjustmentIds.map(String)
+      : [];
+    if (appliedIds.includes(adjustmentId)) continue;
+
+    const updatedProduct = structuredClone(product);
+    const stockBySize = updatedProduct.stockBySize && typeof updatedProduct.stockBySize === 'object' && !Array.isArray(updatedProduct.stockBySize)
+      ? { ...updatedProduct.stockBySize }
+      : {};
+    for (const item of items) {
+      const current = Number(stockBySize[item.size]);
+      if (!Number.isFinite(current) || current < 0) {
+        throw new Error(`Stock for ${product.name || productId} in size ${item.size} is invalid.`);
+      }
+      stockBySize[item.size] = current + item.qty;
+    }
+    updatedProduct.stockBySize = stockBySize;
+    updatedProduct.inventoryAdjustmentIds = [...appliedIds, adjustmentId];
+    productUpdates.set(productId, updatedProduct);
+  }
+
+  if (productUpdates.size === 0) return;
+  const updatedCatalog = catalog.map((product) => productUpdates.get(String(product.id)) || product);
+  await writeCatalog(bucket, updatedCatalog);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
     const route = normalizeRoute(url.pathname);
-    const corsHeaders = getCorsHeaders(env);
+    const adminEndpoint = route.startsWith('/admin/') || (route.startsWith('/orders') && method !== 'POST');
+    const corsHeaders = getCorsHeaders(env, request, adminEndpoint);
+    let adminIdentity = '';
 
     try {
       if (method === 'OPTIONS') {
@@ -537,6 +826,16 @@ export default {
             'Access-Control-Max-Age': '86400',
           },
         });
+      }
+
+      if (adminEndpoint) {
+        if (!hasCloudflareAccessConfig(env)) {
+          return buildError('Cloudflare Access authorization is not configured.', 503, corsHeaders);
+        }
+        adminIdentity = await verifyCloudflareAccess(request, env);
+        if (!adminIdentity) {
+          return buildError('Cloudflare Access authentication is required.', 401, corsHeaders);
+        }
       }
 
       if (!env.KOORTA_DB && route !== '/contact' && route !== '/wholesale-enquiry') {
@@ -812,9 +1111,682 @@ export default {
         return jsonResponse({ success: true }, 200, corsHeaders);
       }
 
-      if (route.startsWith('/orders')) {
+      if (route === '/customer/order-lookup') {
+        if (method !== 'POST') {
+          return buildError('Method not allowed.', 405, corsHeaders);
+        }
+
+        const payload = await parseJson(request);
+        if (!payload || typeof payload !== 'object') {
+          return buildError('Request body must be a JSON object.', 400, corsHeaders);
+        }
+        if (!(await verifyTurnstile(request, payload.turnstileToken, env, 'order_lookup'))) {
+          return buildError('Complete the security check and try again.', 403, corsHeaders);
+        }
+        const orderNumber = sanitizeString(payload.orderNumber);
+        const phone = sanitizeString(payload.phone);
+        if (!orderNumber || orderNumber.length > 80 || !phone || phone.length > 30) {
+          return buildError('Enter a valid order number and phone number.', 400, corsHeaders);
+        }
+
+        const orderRow = await findCustomerOrder(env.KOORTA_DB, orderNumber, phone);
+        if (!orderRow) return buildError('Order number or phone did not match.', 404, corsHeaders);
+        const [itemsResult, transactionsResult] = await Promise.all([
+          env.KOORTA_DB.prepare(
+            'SELECT item_id, name, size, quantity, price FROM order_items WHERE order_number = ? ORDER BY id',
+          ).bind(orderNumber).all(),
+          env.KOORTA_DB.prepare(
+            'SELECT transaction_id, status, amount, metadata FROM transactions WHERE order_number = ?',
+          ).bind(orderNumber).all(),
+        ]);
+        const items = itemsResult.results || [];
+        const transactions = transactionsResult.results || [];
+        const reserved = collectReservedReturnQuantities(transactions);
+        const paidAmount = transactions
+          .filter((transaction) => transaction.status === 'paid' && transaction.amount > 0)
+          .reduce((sum, transaction) => sum + transaction.amount, 0);
+        const returnEligible = isWithinReturnWindow(orderRow.delivered_at)
+          && ['delivered', 'partially_returned'].includes(orderRow.status)
+          && paidAmount >= orderRow.total;
+
+        return jsonResponse({
+          success: true,
+          order: {
+            orderNumber: orderRow.order_number,
+            placedAt: orderRow.placed_at,
+            status: orderRow.status,
+            deliveredAt: orderRow.delivered_at || null,
+            total: orderRow.total,
+            payment: orderRow.payment_method,
+            cancellationEligible: ['pending', 'confirmed'].includes(orderRow.status),
+            returnEligible,
+            requests: transactions
+              .map((transaction) => ({
+                transactionId: transaction.transaction_id,
+                status: transaction.status,
+                amount: transaction.amount,
+                metadata: parseTransactionMetadata(transaction.metadata),
+              }))
+              .filter((transaction) => ['return', 'cancellation'].includes(transaction.metadata.type))
+              .map(({ transactionId, status, amount, metadata }) => ({
+                transactionId,
+                status,
+                amount,
+                type: metadata.type,
+              })),
+            items: items.map((item) => {
+              const isNonReturnable = /made[\s-]?to[\s-]?measure|altered|custom[\s-]?(made|order)/i.test(item.name);
+              const availableQty = Math.max(
+                0,
+                item.quantity - (reserved.get(requestedItemKey(item.item_id, item.size)) || 0),
+              );
+              return {
+                id: item.item_id,
+                name: item.name,
+                size: item.size,
+                qty: item.quantity,
+                price: item.price,
+                returnableQty: isNonReturnable ? 0 : availableQty,
+              };
+            }),
+          },
+        }, 200, corsHeaders);
+      }
+
+      if (route.startsWith('/customer/orders/') && route.endsWith('/requests')) {
+        if (method !== 'POST') {
+          return buildError('Method not allowed.', 405, corsHeaders);
+        }
+        const parts = route.split('/').filter(Boolean);
+        if (parts.length !== 4) return buildError('Invalid order request route.', 404, corsHeaders);
+        let orderNumber;
+        try {
+          orderNumber = decodeURIComponent(parts[2]);
+        } catch {
+          return buildError('Invalid order number.', 400, corsHeaders);
+        }
+        const payload = await parseJson(request);
+        if (!payload || typeof payload !== 'object') {
+          return buildError('Request body must be a JSON object.', 400, corsHeaders);
+        }
+        if (!(await verifyTurnstile(request, payload.turnstileToken, env, 'order_request'))) {
+          return buildError('Complete the security check and try again.', 403, corsHeaders);
+        }
+        const phone = sanitizeString(payload.phone);
+        const reason = sanitizeString(payload.reason);
+        const type = sanitizeString(payload.type);
+        if (!phone || phone.length > 30 || reason.length < 3 || reason.length > 500) {
+          return buildError('A phone number and a short reason (3–500 characters) are required.', 400, corsHeaders);
+        }
+        if (!['return', 'cancellation'].includes(type)) {
+          return buildError('Request type must be return or cancellation.', 400, corsHeaders);
+        }
+
+        const orderRow = await findCustomerOrder(env.KOORTA_DB, orderNumber, phone);
+        if (!orderRow) return buildError('Order number or phone did not match.', 404, corsHeaders);
+        const requestTime = nowISOString();
+        const transactionId = newTransactionId(type);
+        let insertResult;
+        let requestItems = [];
+
+        if (type === 'cancellation') {
+          const metadata = JSON.stringify({
+            type,
+            reason,
+            requestedBy: 'customer',
+            requestedAt: requestTime,
+          });
+          insertResult = await env.KOORTA_DB.prepare(
+            `INSERT INTO transactions (
+              transaction_id, order_number, provider, method, status, amount,
+              external_reference, metadata, created_at, updated_at
+            )
+            SELECT ?, order_number, 'manual', 'cancellation', 'cancellation_requested', 0,
+              NULL, ?, ?, ?
+            FROM orders
+            WHERE order_number = ?
+              AND status IN ('pending', 'confirmed')
+              AND NOT EXISTS (
+                SELECT 1 FROM transactions
+                WHERE order_number = ?
+                  AND json_extract(metadata, '$.type') = 'cancellation'
+                  AND status IN ('cancellation_requested', 'processing', 'inventory_review_required', 'refund_pending', 'cancelled')
+              )`,
+          ).bind(transactionId, metadata, requestTime, requestTime, orderNumber, orderNumber).run();
+        } else {
+          if (payload.policyConfirmed !== true) {
+            return buildError('Confirm that the selected items meet the published return conditions.', 400, corsHeaders);
+          }
+          if (!isWithinReturnWindow(orderRow.delivered_at)
+            || !['delivered', 'partially_returned'].includes(orderRow.status)) {
+            return buildError('This order is not eligible for a return. Returns must be requested within 15 days of delivery.', 409, corsHeaders);
+          }
+          const [itemsResult, transactionsResult] = await Promise.all([
+            env.KOORTA_DB.prepare(
+              'SELECT item_id, name, size, quantity, price FROM order_items WHERE order_number = ? ORDER BY id',
+            ).bind(orderNumber).all(),
+            env.KOORTA_DB.prepare(
+              'SELECT status, amount, metadata FROM transactions WHERE order_number = ?',
+            ).bind(orderNumber).all(),
+          ]);
+          const purchasedItems = itemsResult.results || [];
+          const transactions = transactionsResult.results || [];
+          const paidAmount = transactions
+            .filter((transaction) => transaction.status === 'paid' && transaction.amount > 0)
+            .reduce((sum, transaction) => sum + transaction.amount, 0);
+          if (paidAmount < orderRow.total) {
+            return buildError('A return can be requested after the full order payment is recorded.', 409, corsHeaders);
+          }
+          const reserved = collectReservedReturnQuantities(transactions);
+          const selection = Array.isArray(payload.items) ? payload.items : [];
+          if (selection.length === 0 || selection.length > 20) {
+            return buildError('Select at least one item and quantity to return.', 400, corsHeaders);
+          }
+          const selectedByKey = new Map();
+          for (const selected of selection) {
+            const itemId = sanitizeString(selected?.itemId);
+            const size = sanitizeString(selected?.size);
+            const qty = ensureNumber(selected?.qty);
+            const key = requestedItemKey(itemId, size);
+            if (!itemId || !size || !qty || qty <= 0) {
+              return buildError('Each selected item needs a valid size and positive quantity.', 400, corsHeaders);
+            }
+            selectedByKey.set(key, (selectedByKey.get(key) || 0) + qty);
+          }
+
+          let requestedGross = 0;
+          for (const [key, qty] of selectedByKey) {
+            const separator = key.indexOf('\u0000');
+            const itemId = key.slice(0, separator);
+            const size = key.slice(separator + 1);
+            const matching = purchasedItems.filter((item) => item.item_id === itemId && item.size === size);
+            const purchaseQty = matching.reduce((sum, item) => sum + item.quantity, 0);
+            const isNonReturnable = matching.some((item) => /made[\s-]?to[\s-]?measure|altered|custom[\s-]?(made|order)/i.test(item.name));
+            const alreadyReserved = reserved.get(key) || 0;
+            if (matching.length === 0 || isNonReturnable || qty + alreadyReserved > purchaseQty) {
+              return buildError('One or more selected items are not eligible or exceed the remaining return quantity.', 409, corsHeaders);
+            }
+            const unitPrice = matching[0].price;
+            if (matching.some((item) => item.price !== unitPrice)) {
+              return buildError('The selected item has inconsistent order pricing; contact support.', 409, corsHeaders);
+            }
+            requestedGross += unitPrice * qty;
+            requestItems.push({ itemId, name: matching[0].name, size, qty, price: unitPrice });
+          }
+
+          const selectedJson = JSON.stringify(requestItems);
+          const activeStatuses = "'return_requested','approved','processing','inventory_review_required','refund_pending','refunded'";
+          const priorGross = `(SELECT COALESCE(SUM(CAST(json_extract(metadata, '$.requestedGross') AS INTEGER)), 0) FROM transactions WHERE order_number = o.order_number AND json_extract(metadata, '$.type') = 'return' AND status IN (${activeStatuses}))`;
+          const priorDiscount = `(SELECT COALESCE(SUM(CAST(json_extract(metadata, '$.discountAllocated') AS INTEGER)), 0) FROM transactions WHERE order_number = o.order_number AND json_extract(metadata, '$.type') = 'return' AND status IN (${activeStatuses}))`;
+          const discountAllocation = `MIN(?, MAX(0, ROUND(CASE WHEN o.subtotal > 0 THEN o.discount * MIN(o.subtotal, ${priorGross} + ?) / o.subtotal ELSE 0 END) - ${priorDiscount}))`;
+          const insertSql = `INSERT INTO transactions (
+              transaction_id, order_number, provider, method, status, amount,
+              external_reference, metadata, created_at, updated_at
+            )
+            SELECT ?, o.order_number, 'manual', 'refund', 'return_requested',
+              -MAX(0, ? - ${discountAllocation}),
+              NULL,
+              json_object(
+                'type', 'return',
+                'reason', ?,
+                'requestedBy', 'customer',
+                'customerConfirmedPolicy', true,
+                'items', json(?),
+                'requestedGross', ?,
+                'discountAllocated', ${discountAllocation},
+                'requestedAt', ?
+              ),
+              ?, ?
+            FROM orders o
+            WHERE o.order_number = ?
+              AND o.status IN ('delivered', 'partially_returned')
+              AND o.delivered_at IS NOT NULL
+              AND julianday(o.delivered_at) >= julianday('now', '-15 days')
+              AND julianday(o.delivered_at) <= julianday('now')
+              AND (SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE order_number = o.order_number AND status = 'paid' AND amount > 0)
+                >= o.total - (SELECT COALESCE(SUM(-amount), 0) FROM transactions WHERE order_number = o.order_number AND status IN ('return_requested', 'approved', 'processing', 'inventory_review_required', 'refund_pending', 'refunded') AND amount < 0)
+              AND NOT EXISTS (
+                SELECT 1
+                FROM json_each(?) requested
+                WHERE CAST(json_extract(requested.value, '$.qty') AS INTEGER) + (
+                  SELECT COALESCE(SUM(CAST(json_extract(reserved_item.value, '$.qty') AS INTEGER)), 0)
+                  FROM transactions active
+                  JOIN json_each(active.metadata, '$.items') reserved_item
+                  WHERE active.order_number = o.order_number
+                    AND json_extract(active.metadata, '$.type') = 'return'
+                    AND active.status IN (${activeStatuses})
+                    AND json_extract(reserved_item.value, '$.itemId') = json_extract(requested.value, '$.itemId')
+                    AND json_extract(reserved_item.value, '$.size') = json_extract(requested.value, '$.size')
+                ) > (
+                  SELECT COALESCE(SUM(quantity), 0)
+                  FROM order_items purchased
+                  WHERE purchased.order_number = o.order_number
+                    AND purchased.item_id = json_extract(requested.value, '$.itemId')
+                    AND purchased.size = json_extract(requested.value, '$.size')
+                )
+              )`;
+          insertResult = await env.KOORTA_DB.prepare(insertSql).bind(
+            transactionId,
+            requestedGross,
+            requestedGross,
+            requestedGross,
+            reason,
+            selectedJson,
+            requestedGross,
+            requestedGross,
+            requestedGross,
+            requestTime,
+            requestTime,
+            requestTime,
+            orderNumber,
+            selectedJson,
+          ).run();
+        }
+
+        if (!insertResult?.success || Number(insertResult.meta?.changes || 0) !== 1) {
+          return buildError('This request could not be submitted because the order is no longer eligible or a request is already in progress.', 409, corsHeaders);
+        }
+        const order = await getOrder(env.KOORTA_DB, orderNumber);
+        const requestTransaction = await env.KOORTA_DB.prepare(
+          'SELECT amount FROM transactions WHERE transaction_id = ?',
+        ).bind(transactionId).first();
+        const refundAmount = type === 'return' ? Math.abs(Number(requestTransaction?.amount || 0)) : undefined;
+        const emailNotifications = await sendOrderLifecycleNotifications(order, env, {
+          title: type === 'return' ? 'Return request received' : 'Cancellation request received',
+          message: type === 'return'
+            ? 'A customer has requested a return. The request is awaiting review; the estimated refund is not approved until items are received and inspected.'
+            : 'A customer has requested cancellation. The request is awaiting review and will be cancelled only if it is still before dispatch.',
+          ...(refundAmount !== undefined ? { amount: -refundAmount } : {}),
+          reason,
+          items: requestItems,
+        });
+        return jsonResponse({
+          success: true,
+          transactionId,
+          status: type === 'return' ? 'return_requested' : 'cancellation_requested',
+          ...(refundAmount !== undefined ? { estimatedRefund: refundAmount } : {}),
+          emailNotifications,
+        }, 201, corsHeaders);
+      }
+
+      if (route.startsWith('/admin/orders/') && method === 'POST') {
+        if (method !== 'POST') {
+          return buildError('Method not allowed.', 405, corsHeaders);
+        }
+        const parts = route.split('/').filter(Boolean);
+        let orderNumber;
+        try {
+          orderNumber = decodeURIComponent(parts[2] || '');
+        } catch {
+          return buildError('Invalid order number.', 400, corsHeaders);
+        }
+        if (!orderNumber) return buildError('Order number is required.', 400, corsHeaders);
+        const payload = await parseJson(request);
+        if (!payload || typeof payload !== 'object') {
+          return buildError('Request body must be a JSON object.', 400, corsHeaders);
+        }
+
+        if (parts.length === 4 && parts[3] === 'status') {
+          const nextStatus = sanitizeString(payload.status);
+          const transitions = {
+            pending: 'confirmed',
+            confirmed: 'shipped',
+            shipped: 'delivered',
+          };
+          const orderRow = await env.KOORTA_DB.prepare(
+            'SELECT status FROM orders WHERE order_number = ?',
+          ).bind(orderNumber).first();
+          if (!orderRow) return buildError('Order not found.', 404, corsHeaders);
+          if (transitions[orderRow.status] !== nextStatus) {
+            return buildError('Order fulfillment must advance one step at a time: pending → confirmed → shipped → delivered.', 409, corsHeaders);
+          }
+          const updatedAt = nowISOString();
+          const result = await env.KOORTA_DB.prepare(
+            `UPDATE orders
+             SET status = ?, delivered_at = CASE WHEN ? = 'delivered' THEN ? ELSE delivered_at END,
+                 updated_at = ?
+             WHERE order_number = ? AND status = ?`,
+          ).bind(nextStatus, nextStatus, updatedAt, updatedAt, orderNumber, orderRow.status).run();
+          if (Number(result.meta?.changes || 0) !== 1) {
+            return buildError('The order status changed; reload and try again.', 409, corsHeaders);
+          }
+          return jsonResponse({ success: true, status: nextStatus, deliveredAt: nextStatus === 'delivered' ? updatedAt : null }, 200, corsHeaders);
+        }
+
+        if (parts.length === 4 && parts[3] === 'payment') {
+          const payment = await env.KOORTA_DB.prepare(
+            `SELECT transactions.transaction_id, transactions.status, transactions.amount
+             FROM transactions
+             JOIN orders ON orders.order_number = transactions.order_number
+             WHERE transactions.order_number = ? AND transactions.amount > 0
+               AND orders.status NOT IN ('cancelled', 'cancellation_processing')
+             ORDER BY transactions.created_at LIMIT 1`,
+          ).bind(orderNumber).first();
+          if (!payment) return buildError('No payable transaction was found for this order.', 404, corsHeaders);
+          if (payment.status === 'paid') {
+            return jsonResponse({ success: true, status: 'paid' }, 200, corsHeaders);
+          }
+          if (payment.status !== 'pending') {
+            return buildError('Only a pending payment can be marked as received.', 409, corsHeaders);
+          }
+          const reference = sanitizeString(payload.reference);
+          if (reference.length > 200) return buildError('Payment reference must be 200 characters or fewer.', 400, corsHeaders);
+          const paidAt = nowISOString();
+          const update = await env.KOORTA_DB.prepare(
+            `UPDATE transactions
+             SET status = 'paid', external_reference = ?, metadata = json_set(COALESCE(metadata, '{}'), '$.paymentConfirmedAt', ?, '$.paymentConfirmedBy', ?),
+                 updated_at = ?
+             WHERE transaction_id = ? AND status = 'pending' AND amount > 0
+               AND EXISTS (SELECT 1 FROM orders WHERE order_number = ? AND status NOT IN ('cancelled', 'cancellation_processing'))`,
+          ).bind(reference || null, paidAt, adminIdentity, paidAt, payment.transaction_id, orderNumber).run();
+          if (Number(update.meta?.changes || 0) !== 1) {
+            return buildError('The payment status changed; reload and try again.', 409, corsHeaders);
+          }
+          return jsonResponse({ success: true, status: 'paid' }, 200, corsHeaders);
+        }
+
+        if (parts.length !== 5 || parts[3] !== 'requests') {
+          return buildError('Unknown admin order action.', 404, corsHeaders);
+        }
+        let transactionId;
+        try {
+          transactionId = decodeURIComponent(parts[4]);
+        } catch {
+          return buildError('Invalid request ID.', 400, corsHeaders);
+        }
+        const action = sanitizeString(payload.action);
+        const row = await env.KOORTA_DB.prepare(
+          `SELECT transaction_id, status, amount, external_reference, metadata
+           FROM transactions WHERE transaction_id = ? AND order_number = ?`,
+        ).bind(transactionId, orderNumber).first();
+        if (!row) return buildError('Order request not found.', 404, corsHeaders);
+        const metadata = parseTransactionMetadata(row.metadata);
+        const order = await getOrder(env.KOORTA_DB, orderNumber);
+        if (!order) return buildError('Order not found.', 404, corsHeaders);
+        const itemDetails = Array.isArray(metadata.items) ? metadata.items : [];
+        const reason = sanitizeString(metadata.reason);
+        const changedAt = nowISOString();
+
+        if (action === 'reject') {
+          if (!['return_requested', 'cancellation_requested', 'approved'].includes(row.status)) {
+            return buildError('Only an unprocessed request can be rejected.', 409, corsHeaders);
+          }
+          const note = sanitizeString(payload.note);
+          if (note.length > 500) return buildError('Admin note must be 500 characters or fewer.', 400, corsHeaders);
+          const nextMetadata = {
+            ...metadata,
+            reviewedAt: changedAt,
+            reviewedBy: adminIdentity,
+            adminNote: note,
+          };
+          const update = await env.KOORTA_DB.prepare(
+            `UPDATE transactions SET status = 'rejected', metadata = ?, updated_at = ?
+             WHERE transaction_id = ? AND status = ?`,
+          ).bind(JSON.stringify(nextMetadata), changedAt, transactionId, row.status).run();
+          if (Number(update.meta?.changes || 0) !== 1) {
+            return buildError('The request changed; reload and try again.', 409, corsHeaders);
+          }
+          const emailNotifications = await sendOrderLifecycleNotifications(order, env, {
+            title: metadata.type === 'return' ? 'Return request update' : 'Cancellation request update',
+            message: metadata.type === 'return'
+              ? 'We could not approve the return request. Please contact our team if you need help.'
+              : 'We could not approve the cancellation request. The order remains active.',
+            reason: note || reason,
+            items: itemDetails,
+          });
+          return jsonResponse({ success: true, status: 'rejected', emailNotifications }, 200, corsHeaders);
+        }
+
+        if (metadata.type === 'return' && action === 'approve') {
+          if (row.status === 'approved') return jsonResponse({ success: true, status: 'approved' }, 200, corsHeaders);
+          if (row.status !== 'return_requested') {
+            return buildError('Only a newly requested return can be approved.', 409, corsHeaders);
+          }
+          const nextMetadata = { ...metadata, approvedAt: changedAt, approvedBy: adminIdentity };
+          const update = await env.KOORTA_DB.prepare(
+            `UPDATE transactions SET status = 'approved', metadata = ?, updated_at = ?
+             WHERE transaction_id = ? AND status = 'return_requested'`,
+          ).bind(JSON.stringify(nextMetadata), changedAt, transactionId).run();
+          if (Number(update.meta?.changes || 0) !== 1) {
+            return buildError('The request changed; reload and try again.', 409, corsHeaders);
+          }
+          const emailNotifications = await sendOrderLifecycleNotifications(order, env, {
+            title: 'Return request approved',
+            message: 'Your return is approved. Our team will coordinate the free reverse pickup. A refund is recorded only after the items are received and inspected.',
+            amount: Number(row.amount || 0),
+            reason,
+            items: itemDetails,
+          });
+          return jsonResponse({ success: true, status: 'approved', emailNotifications }, 200, corsHeaders);
+        }
+
+        if (metadata.type === 'cancellation' && action === 'approve') {
+          if (['refund_pending', 'cancelled'].includes(row.status)) {
+            return jsonResponse({ success: true, status: row.status }, 200, corsHeaders);
+          }
+          if (!['cancellation_requested', 'inventory_review_required', 'processing'].includes(row.status)) {
+            return buildError('Only a pending cancellation can be approved.', 409, corsHeaders);
+          }
+          const orderStatus = (await env.KOORTA_DB.prepare(
+            'SELECT status FROM orders WHERE order_number = ?',
+          ).bind(orderNumber).first())?.status;
+          if (!['pending', 'confirmed', 'cancellation_processing'].includes(orderStatus)) {
+            return buildError('Cancellation is allowed only before dispatch.', 409, corsHeaders);
+          }
+          if (row.status === 'cancellation_requested') {
+            if (!['pending', 'confirmed'].includes(orderStatus)) {
+              return buildError('Cancellation is allowed only before dispatch.', 409, corsHeaders);
+            }
+            const startedAt = nowISOString();
+            const startedMetadata = { ...metadata, approvedAt: startedAt, approvedBy: adminIdentity };
+            const start = await env.KOORTA_DB.batch([
+              env.KOORTA_DB.prepare(
+                `UPDATE orders SET status = 'cancellation_processing', updated_at = ?
+                 WHERE order_number = ? AND status IN ('pending', 'confirmed')`,
+              ).bind(startedAt, orderNumber),
+              env.KOORTA_DB.prepare(
+                `UPDATE transactions SET status = 'processing', metadata = ?, updated_at = ?
+                 WHERE transaction_id = ? AND status IN ('cancellation_requested', 'inventory_review_required')`,
+              ).bind(JSON.stringify(startedMetadata), startedAt, transactionId),
+            ]);
+            if (Number(start[0]?.meta?.changes || 0) !== 1 || Number(start[1]?.meta?.changes || 0) !== 1) {
+              return buildError('The cancellation could not be started; reload and retry.', 409, corsHeaders);
+            }
+          } else if (row.status === 'inventory_review_required') {
+            if (orderStatus !== 'cancellation_processing') {
+              return buildError('Cancellation cannot be retried because the order is no longer processing.', 409, corsHeaders);
+            }
+            const retryAt = nowISOString();
+            const retryMetadata = { ...metadata, inventoryRetryAt: retryAt, inventoryRetryBy: adminIdentity };
+            const retry = await env.KOORTA_DB.prepare(
+              `UPDATE transactions SET status = 'processing', metadata = ?, updated_at = ?
+               WHERE transaction_id = ? AND status = 'inventory_review_required'`,
+            ).bind(JSON.stringify(retryMetadata), retryAt, transactionId).run();
+            if (Number(retry.meta?.changes || 0) !== 1) {
+              return buildError('The cancellation changed; reload and try again.', 409, corsHeaders);
+            }
+          } else if (row.status !== 'processing' || orderStatus !== 'cancellation_processing') {
+            return buildError('Cancellation is already being processed; reload and retry.', 409, corsHeaders);
+          }
+
+          try {
+            await restoreCatalogStockForOrder(
+              env.GARMENT_BUCKET,
+              order.items.map((item) => ({ itemId: String(item.id), size: item.size, qty: item.qty })),
+              `cancel-${transactionId}`,
+            );
+          } catch (error) {
+            console.error(`Inventory restoration failed for cancellation ${transactionId}:`, error);
+            const failedAt = nowISOString();
+            const retryMetadata = { ...metadata, inventoryIssueAt: failedAt, inventoryIssue: error instanceof Error ? error.message : String(error) };
+            await env.KOORTA_DB.prepare(
+              `UPDATE transactions SET status = 'inventory_review_required', metadata = ?, updated_at = ?
+               WHERE transaction_id = ? AND status = 'processing'`,
+            ).bind(JSON.stringify(retryMetadata), failedAt, transactionId).run();
+            return buildError('Cancellation is saved but inventory restoration needs an admin retry. The order remains in cancellation processing.', 409, corsHeaders);
+          }
+
+          const paymentsResult = await env.KOORTA_DB.prepare(
+            'SELECT transaction_id, status, amount FROM transactions WHERE order_number = ? AND amount > 0',
+          ).bind(orderNumber).all();
+          const payments = paymentsResult.results || [];
+          const collectedAmount = payments
+            .filter((payment) => payment.status === 'paid')
+            .reduce((sum, payment) => sum + payment.amount, 0);
+          const finalAmount = collectedAmount > 0 ? -collectedAmount : 0;
+          const finalStatus = collectedAmount > 0 ? 'refund_pending' : 'cancelled';
+          const finalizedAt = nowISOString();
+          const finalMetadata = {
+            ...metadata,
+            approvedAt: metadata.approvedAt || finalizedAt,
+            approvedBy: metadata.approvedBy || adminIdentity,
+            inventoryRestoredAt: finalizedAt,
+            refundAmount: collectedAmount,
+          };
+          const finalStatements = [
+            env.KOORTA_DB.prepare(
+              `UPDATE orders SET status = 'cancelled', updated_at = ?
+               WHERE order_number = ? AND status = 'cancellation_processing'`,
+            ).bind(finalizedAt, orderNumber),
+            env.KOORTA_DB.prepare(
+              `UPDATE transactions SET status = ?, amount = ?, metadata = ?, updated_at = ?
+               WHERE transaction_id = ? AND status = 'processing'
+                 AND EXISTS (SELECT 1 FROM orders WHERE order_number = ? AND status = 'cancelled')`,
+            ).bind(finalStatus, finalAmount, JSON.stringify(finalMetadata), finalizedAt, transactionId, orderNumber),
+            ...payments
+              .filter((payment) => payment.status === 'pending')
+              .map((payment) => env.KOORTA_DB.prepare(
+                `UPDATE transactions SET status = 'cancelled', updated_at = ?
+                 WHERE transaction_id = ? AND status = 'pending'`,
+              ).bind(finalizedAt, payment.transaction_id)),
+          ];
+          const finalized = await env.KOORTA_DB.batch(finalStatements);
+          if (Number(finalized[0]?.meta?.changes || 0) !== 1 || Number(finalized[1]?.meta?.changes || 0) !== 1) {
+            return buildError('Inventory was restored, but the cancellation ledger could not be finalized. Retry the action to reconcile it.', 409, corsHeaders);
+          }
+          const emailNotifications = await sendOrderLifecycleNotifications(order, env, {
+            title: 'Order cancellation approved',
+            message: collectedAmount > 0
+              ? 'Your cancellation is approved. The refund is pending manual processing; our team will notify you after it is sent.'
+              : 'Your cancellation is approved and the order has been cancelled. No payment had been collected, so no refund is due.',
+            ...(collectedAmount > 0 ? { amount: -collectedAmount } : {}),
+            reason,
+            items: order.items.map((item) => ({ name: item.name, size: item.size, qty: item.qty })),
+          });
+          return jsonResponse({ success: true, status: finalStatus, emailNotifications }, 200, corsHeaders);
+        }
+
+        if (metadata.type === 'return' && action === 'receive') {
+          if (!['approved', 'inventory_review_required', 'processing'].includes(row.status)) {
+            return buildError('Approve the return before marking items received.', 409, corsHeaders);
+          }
+          if (row.status !== 'processing') {
+            const receivingAt = nowISOString();
+            const receivedMetadata = { ...metadata, receivedAt: receivingAt, receivedBy: adminIdentity };
+            const start = await env.KOORTA_DB.prepare(
+              `UPDATE transactions SET status = 'processing', metadata = ?, updated_at = ?
+               WHERE transaction_id = ? AND status IN ('approved', 'inventory_review_required')`,
+            ).bind(JSON.stringify(receivedMetadata), receivingAt, transactionId).run();
+            if (Number(start.meta?.changes || 0) !== 1) {
+              return buildError('The return status changed; reload and try again.', 409, corsHeaders);
+            }
+          }
+          try {
+            await restoreCatalogStockForOrder(
+              env.GARMENT_BUCKET,
+              itemDetails.map((item) => ({ itemId: String(item.itemId), size: item.size, qty: item.qty })),
+              `return-${transactionId}`,
+            );
+          } catch (error) {
+            console.error(`Inventory restoration failed for return ${transactionId}:`, error);
+            const failedAt = nowISOString();
+            const retryMetadata = { ...metadata, inventoryIssueAt: failedAt, inventoryIssue: error instanceof Error ? error.message : String(error) };
+            await env.KOORTA_DB.prepare(
+              `UPDATE transactions SET status = 'inventory_review_required', metadata = ?, updated_at = ?
+               WHERE transaction_id = ? AND status = 'processing'`,
+            ).bind(JSON.stringify(retryMetadata), failedAt, transactionId).run();
+            return buildError('Return receipt is saved but inventory restoration needs an admin retry.', 409, corsHeaders);
+          }
+
+          const receivedAt = nowISOString();
+          const nextStatus = Number(row.amount) < 0 ? 'refund_pending' : 'refunded';
+          const receivedMetadata = { ...metadata, inventoryRestoredAt: receivedAt };
+          const update = await env.KOORTA_DB.prepare(
+            `UPDATE transactions SET status = ?, metadata = ?, external_reference = CASE WHEN ? = 'refunded' THEN 'No monetary refund due' ELSE external_reference END, updated_at = ?
+             WHERE transaction_id = ? AND status = 'processing'`,
+          ).bind(nextStatus, JSON.stringify(receivedMetadata), nextStatus, receivedAt, transactionId).run();
+          if (Number(update.meta?.changes || 0) !== 1) {
+            return buildError('Items were received, but the return ledger could not be finalized. Retry the action to reconcile it.', 409, corsHeaders);
+          }
+          const emailNotifications = await sendOrderLifecycleNotifications(order, env, {
+            title: 'Returned items received',
+            message: Number(row.amount) < 0
+              ? 'We received and inspected your returned items. Your refund is pending manual processing.'
+              : 'We received and inspected your returned items. No monetary refund is due for this return.',
+            amount: Number(row.amount),
+            reason,
+            items: itemDetails,
+          });
+          return jsonResponse({ success: true, status: nextStatus, emailNotifications }, 200, corsHeaders);
+        }
+
+        if (action === 'refund') {
+          if (row.status === 'refunded') return jsonResponse({ success: true, status: 'refunded' }, 200, corsHeaders);
+          if (row.status !== 'refund_pending' || Number(row.amount) >= 0) {
+            return buildError('Only a pending negative refund transaction can be marked as refunded.', 409, corsHeaders);
+          }
+          const reference = sanitizeString(payload.reference);
+          if (!reference || reference.length > 200) {
+            return buildError('Enter the refund payment reference (maximum 200 characters).', 400, corsHeaders);
+          }
+          const refundAt = nowISOString();
+          const refundedMetadata = { ...metadata, refundedAt: refundAt, refundedBy: adminIdentity };
+          const update = await env.KOORTA_DB.prepare(
+            `UPDATE transactions SET status = 'refunded', external_reference = ?, metadata = ?, updated_at = ?
+             WHERE transaction_id = ? AND status = 'refund_pending' AND amount < 0`,
+          ).bind(reference, JSON.stringify(refundedMetadata), refundAt, transactionId).run();
+          if (Number(update.meta?.changes || 0) !== 1) {
+            return buildError('The refund status changed; reload and try again.', 409, corsHeaders);
+          }
+
+          if (metadata.type === 'return') {
+            const transactionsResult = await env.KOORTA_DB.prepare(
+              'SELECT status, metadata FROM transactions WHERE order_number = ?',
+            ).bind(orderNumber).all();
+            const returned = collectReservedReturnQuantities(transactionsResult.results || []);
+            const purchasedResult = await env.KOORTA_DB.prepare(
+              'SELECT item_id, size, SUM(quantity) AS quantity FROM order_items WHERE order_number = ? GROUP BY item_id, size',
+            ).bind(orderNumber).all();
+            const allItemsReturned = (purchasedResult.results || []).every((item) => (
+              (returned.get(requestedItemKey(item.item_id, item.size)) || 0) >= item.quantity
+            ));
+            const nextOrderStatus = allItemsReturned ? 'returned' : 'partially_returned';
+            await env.KOORTA_DB.prepare(
+              `UPDATE orders SET status = ?, updated_at = ?
+               WHERE order_number = ? AND status IN ('delivered', 'partially_returned', 'returned')`,
+            ).bind(nextOrderStatus, refundAt, orderNumber).run();
+          }
+
+          const emailNotifications = await sendOrderLifecycleNotifications(order, env, {
+            title: 'Refund sent',
+            message: 'Your refund has been sent. The payment reference is included below for your records.',
+            amount: Number(row.amount),
+            reference,
+            reason,
+            items: itemDetails,
+          });
+          return jsonResponse({ success: true, status: 'refunded', emailNotifications }, 200, corsHeaders);
+        }
+
+        return buildError('Action is not valid for this request.', 400, corsHeaders);
+      }
+
+      const orderRoute = route.startsWith('/admin/orders')
+        ? route.replace(/^\/admin\/orders/, '/orders')
+        : route;
+      if (orderRoute.startsWith('/orders')) {
         if (method === 'GET') {
-          const parts = route.split('/').filter(Boolean);
+          const parts = orderRoute.split('/').filter(Boolean);
           if (parts.length === 2) {
             const orderNumber = parts[1];
             const record = await getOrder(env.KOORTA_DB, orderNumber);
@@ -879,7 +1851,7 @@ export default {
               status: t.status,
               amount: t.amount,
               externalReference: t.external_reference,
-              metadata: t.metadata ? JSON.parse(t.metadata) : null,
+              metadata: parseTransactionMetadata(t.metadata),
               createdAt: t.created_at,
               updatedAt: t.updated_at,
             });
@@ -908,6 +1880,7 @@ export default {
             shipping: orderRow.shipping,
             total: orderRow.total,
             status: orderRow.status,
+            deliveredAt: orderRow.delivered_at || null,
             items: itemsByOrder[orderRow.order_number] || [],
             transactions: txByOrder[orderRow.order_number] || [],
           }));
@@ -915,7 +1888,7 @@ export default {
           return jsonResponse({ success: true, orders: assembled }, 200, corsHeaders);
         }
 
-        if (method === 'POST') {
+        if (method === 'POST' && orderRoute === '/orders') {
           const apiKey = request.headers.get('x-koorta-db-api-key') || '';
           if (!env.KOORTA_DB_WORKER_API_SECRET || apiKey !== env.KOORTA_DB_WORKER_API_SECRET) {
             return buildError('Unauthorized request.', 401, corsHeaders);
@@ -1070,4 +2043,14 @@ export default {
       return buildError(`Internal worker error: ${message}`, 500, corsHeaders);
     }
   },
+};
+
+export {
+  getCorsHeaders,
+  collectReservedReturnQuantities,
+  isWithinReturnWindow,
+  normalizePhone,
+  restoreCatalogStockForOrder,
+  verifyCloudflareAccess,
+  verifyTurnstile,
 };

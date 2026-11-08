@@ -3,8 +3,12 @@ main = "src/index.js"
 compatibility_date = "2026-08-09"
 
 [vars]
-ALLOWED_ORIGIN = "*"
+ACCESS_ISSUER = "https://koortadotcom.cloudflareaccess.com"
+ACCESS_AUD = "1016bc0e09dd8e7703407cb47a90270907c16d523044f44f71b0ba3ac73acc03"
+ADMIN_UI_ORIGINS = "https://koorta.com"
 RESEND_FROM_EMAIL = "Koorta Orders <admin@koorta.com>"
+TURNSTILE_HOSTNAMES = "koorta.com,www.koorta.com"
+#TURNSTILE_SECRET_KEY = "Add it to settings on worker as secret. Not here"
 
 [[d1_databases]]
 binding = "KOORTA_DB"
