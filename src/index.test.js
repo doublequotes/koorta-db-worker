@@ -554,6 +554,25 @@ test("handles a discounted partial return through approval, restock, and refund"
       ["customer@example.com"],
     ]);
     const requested = await requestResponse.json();
+    const timelineResponse = await worker.fetch(
+      new Request("https://db.koorta.com/customer/order-lookup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          orderNumber: "ORD-1",
+          phone: "9820000000",
+          turnstileToken: "lookup-token",
+        }),
+      }),
+      env,
+    );
+    assert.equal(timelineResponse.status, 200);
+    const timeline = await timelineResponse.json();
+    assert.equal(timeline.order.paymentReceived, true);
+    assert.equal(timeline.order.requests.length, 1);
+    assert.equal(timeline.order.requests[0].transactionId, requested.transactionId);
+    assert.equal(timeline.order.requests[0].type, "return");
+    assert.ok(timeline.order.requests[0].requestedAt);
     assert.equal(requested.estimatedRefund, 720);
     let ledger = database
       .prepare("SELECT amount, status, metadata FROM transactions WHERE transaction_id = ?")

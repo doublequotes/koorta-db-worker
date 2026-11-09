@@ -1136,7 +1136,7 @@ export default {
             'SELECT item_id, name, size, quantity, price FROM order_items WHERE order_number = ? ORDER BY id',
           ).bind(orderNumber).all(),
           env.KOORTA_DB.prepare(
-            'SELECT transaction_id, status, amount, metadata FROM transactions WHERE order_number = ?',
+            'SELECT transaction_id, status, amount, metadata, created_at FROM transactions WHERE order_number = ?',
           ).bind(orderNumber).all(),
         ]);
         const items = itemsResult.results || [];
@@ -1158,6 +1158,7 @@ export default {
             deliveredAt: orderRow.delivered_at || null,
             total: orderRow.total,
             payment: orderRow.payment_method,
+            paymentReceived: paidAmount >= orderRow.total,
             cancellationEligible: ['pending', 'confirmed'].includes(orderRow.status),
             returnEligible,
             requests: transactions
@@ -1168,11 +1169,15 @@ export default {
                 metadata: parseTransactionMetadata(transaction.metadata),
               }))
               .filter((transaction) => ['return', 'cancellation'].includes(transaction.metadata.type))
-              .map(({ transactionId, status, amount, metadata }) => ({
+              .map(({ transactionId, status, amount, metadata, created_at: createdAt }) => ({
                 transactionId,
                 status,
                 amount,
                 type: metadata.type,
+                requestedAt: metadata.requestedAt || createdAt || null,
+                approvedAt: metadata.approvedAt || null,
+                receivedAt: metadata.receivedAt || metadata.inventoryRestoredAt || null,
+                refundedAt: metadata.refundedAt || null,
               })),
             items: items.map((item) => {
               const isNonReturnable = /made[\s-]?to[\s-]?measure|altered|custom[\s-]?(made|order)/i.test(item.name);
