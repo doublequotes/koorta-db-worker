@@ -160,6 +160,109 @@ test("reports missing Cloudflare Access configuration for admin routes", async (
   assert.equal(response.status, 503);
 });
 
+test("generates an Access-protected monthly cash report using India time and completed events only", async () => {
+  const { database, d1 } = createOrderDatabase({
+    orderStatus: "pending",
+    paymentStatus: "pending",
+    total: 2000,
+    discount: 0,
+    shipping: 0,
+  });
+  const accessToken = await (await createAccessCredentials())();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    if (String(input).includes("/cdn-cgi/access/certs")) {
+      return new Response(JSON.stringify({ keys: [accessToken.jwk] }), { status: 200 });
+    }
+    throw new Error(`Unexpected fetch in test: ${String(input)}`);
+  };
+  database.prepare(
+    `INSERT INTO transactions (
+      transaction_id, order_number, provider, method, status, amount, external_reference, metadata, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "payment-nov",
+    "ORD-1",
+    "upi",
+    "upi",
+    "paid",
+    2000,
+    "upi-payment-ref",
+    JSON.stringify({ paymentConfirmedAt: "2026-10-31T18:35:00.000Z" }),
+    "2026-10-31T18:35:00.000Z",
+  );
+  database.prepare(
+    `INSERT INTO transactions (
+      transaction_id, order_number, provider, method, status, amount, external_reference, metadata, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "refund-nov",
+    "ORD-1",
+    "manual",
+    "refund",
+    "refunded",
+    -300,
+    "refund-ref",
+    JSON.stringify({ type: "return", refundedAt: "2026-11-30T18:00:00.000Z" }),
+    "2026-11-30T18:00:00.000Z",
+  );
+  database.prepare(
+    `INSERT INTO transactions (
+      transaction_id, order_number, provider, method, status, amount, metadata, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "refund-pending",
+    "ORD-1",
+    "manual",
+    "refund",
+    "refund_pending",
+    -500,
+    JSON.stringify({ type: "return" }),
+    "2026-11-15T12:00:00.000Z",
+  );
+  const env = {
+    KOORTA_DB: d1,
+    ACCESS_ISSUER: "https://koorta-flow-test.cloudflareaccess.com",
+    ACCESS_AUD: "koorta-flow-test-audience",
+    ADMIN_UI_ORIGINS: "https://koorta.com",
+  };
+  const request = new Request(
+    "https://db.koorta.com/admin/reports/monthly?year=2026&month=11",
+    {
+      headers: {
+        "cf-access-jwt-assertion": accessToken.token,
+        origin: "https://koorta.com",
+      },
+    },
+  );
+
+  try {
+    const response = await worker.fetch(request, env);
+    assert.equal(response.status, 200);
+    const report = await response.json();
+    assert.equal(report.summary.cashCollected, 2000);
+    assert.equal(report.summary.refundsPaid, 300);
+    assert.equal(report.summary.netCashCollected, 1700);
+    assert.equal(report.summary.paymentCount, 1);
+    assert.equal(report.summary.refundCount, 1);
+    assert.deepEqual(
+      report.transactions.map((transaction) => transaction.transaction_id),
+      ["payment-nov", "refund-nov"],
+    );
+
+    const invalidMonth = await worker.fetch(
+      new Request("https://db.koorta.com/admin/reports/monthly?year=2026&month=13", {
+        headers: { "cf-access-jwt-assertion": accessToken.token },
+      }),
+      env,
+    );
+    assert.equal(invalidMonth.status, 400);
+  } finally {
+    globalThis.fetch = originalFetch;
+    database.close();
+  }
+});
+
 test("verifies Turnstile action and allowed hostname server-side", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (_url, init) => {

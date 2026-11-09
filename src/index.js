@@ -1781,6 +1781,73 @@ export default {
         return buildError('Action is not valid for this request.', 400, corsHeaders);
       }
 
+      if (route === '/admin/reports/monthly') {
+        if (method !== 'GET') {
+          return buildError('Method not allowed.', 405, corsHeaders);
+        }
+
+        const year = Number(url.searchParams.get('year'));
+        const month = Number(url.searchParams.get('month'));
+        const currentYear = new Date().getUTCFullYear();
+        if (!Number.isInteger(year) || year < 2000 || year > currentYear) {
+          return buildError(`Year must be a whole number between 2000 and ${currentYear}.`, 400, corsHeaders);
+        }
+        if (!Number.isInteger(month) || month < 1 || month > 12) {
+          return buildError('Month must be a whole number between 1 and 12.', 400, corsHeaders);
+        }
+
+        const monthStartUtc = new Date(Date.UTC(year, month - 1, 1) - 330 * 60 * 1000).toISOString();
+        const nextMonthStartUtc = new Date(Date.UTC(year, month, 1) - 330 * 60 * 1000).toISOString();
+        const transactionsResult = await env.KOORTA_DB.prepare(
+          `WITH completed_money_events AS (
+             SELECT
+               transaction_id,
+               order_number,
+               method,
+               status,
+               amount,
+               external_reference,
+               CASE WHEN amount > 0 THEN 'payment' ELSE 'refund' END AS event_type,
+               CASE
+                 WHEN amount > 0 THEN COALESCE(json_extract(metadata, '$.paymentConfirmedAt'), updated_at)
+                 ELSE COALESCE(json_extract(metadata, '$.refundedAt'), updated_at)
+               END AS event_at
+             FROM transactions
+             WHERE (status = 'paid' AND amount > 0)
+                OR (status = 'refunded' AND amount < 0)
+           )
+           SELECT transaction_id, order_number, method, status, amount, external_reference, event_type, event_at
+           FROM completed_money_events
+           WHERE event_at IS NOT NULL
+             AND datetime(event_at) >= datetime(?)
+             AND datetime(event_at) < datetime(?)
+           ORDER BY event_at, order_number, transaction_id`,
+        ).bind(monthStartUtc, nextMonthStartUtc).all();
+        const transactions = transactionsResult.results || [];
+        const cashCollected = transactions
+          .filter((transaction) => transaction.event_type === 'payment')
+          .reduce((sum, transaction) => sum + Number(transaction.amount), 0);
+        const refundsPaid = transactions
+          .filter((transaction) => transaction.event_type === 'refund')
+          .reduce((sum, transaction) => sum + Math.abs(Number(transaction.amount)), 0);
+
+        return jsonResponse({
+          success: true,
+          year,
+          month,
+          currency: 'INR',
+          basis: 'completed cash movements by transaction event time (Asia/Kolkata)',
+          summary: {
+            cashCollected,
+            refundsPaid,
+            netCashCollected: cashCollected - refundsPaid,
+            paymentCount: transactions.filter((transaction) => transaction.event_type === 'payment').length,
+            refundCount: transactions.filter((transaction) => transaction.event_type === 'refund').length,
+          },
+          transactions,
+        }, 200, corsHeaders);
+      }
+
       const orderRoute = route.startsWith('/admin/orders')
         ? route.replace(/^\/admin\/orders/, '/orders')
         : route;
