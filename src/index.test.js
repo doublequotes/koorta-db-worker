@@ -476,6 +476,7 @@ test("handles a discounted partial return through approval, restock, and refund"
   const getAccessToken = await createAccessCredentials();
   const accessToken = await getAccessToken();
   const originalFetch = globalThis.fetch;
+  const emailRecipients = [];
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input);
     if (url.includes("/cdn-cgi/access/certs")) {
@@ -493,6 +494,7 @@ test("handles a discounted partial return through approval, restock, and refund"
       );
     }
     if (url === "https://api.resend.com/emails") {
+      emailRecipients.push(JSON.parse(init.body).to);
       return new Response(JSON.stringify({ id: "email-test-id" }), { status: 200 });
     }
     throw new Error(`Unexpected fetch in test: ${url}`);
@@ -547,6 +549,10 @@ test("handles a discounted partial return through approval, restock, and refund"
       env,
     );
     assert.equal(requestResponse.status, 201);
+    assert.deepEqual(emailRecipients.splice(0), [
+      ["admin@koorta.com"],
+      ["customer@example.com"],
+    ]);
     const requested = await requestResponse.json();
     assert.equal(requested.estimatedRefund, 720);
     let ledger = database
@@ -565,6 +571,7 @@ test("handles a discounted partial return through approval, restock, and refund"
       env,
     );
     assert.equal(approveResponse.status, 200);
+    assert.deepEqual(emailRecipients.splice(0), [["customer@example.com"]]);
 
     const receiveResponse = await worker.fetch(
       new Request(requestEndpoint, {
@@ -575,6 +582,7 @@ test("handles a discounted partial return through approval, restock, and refund"
       env,
     );
     assert.equal(receiveResponse.status, 200);
+    assert.deepEqual(emailRecipients.splice(0), []);
     assert.equal(bucket.catalog[0].stockBySize.M, 3);
 
     const refundResponse = await worker.fetch(
@@ -586,6 +594,7 @@ test("handles a discounted partial return through approval, restock, and refund"
       env,
     );
     assert.equal(refundResponse.status, 200);
+    assert.deepEqual(emailRecipients.splice(0), [["customer@example.com"]]);
     ledger = database
       .prepare(
         "SELECT amount, status, external_reference FROM transactions WHERE transaction_id = ?",
@@ -615,6 +624,10 @@ test("handles a discounted partial return through approval, restock, and refund"
       env,
     );
     assert.equal(secondRequestResponse.status, 201);
+    assert.deepEqual(emailRecipients.splice(0), [
+      ["admin@koorta.com"],
+      ["customer@example.com"],
+    ]);
     const secondRequest = await secondRequestResponse.json();
     assert.equal(secondRequest.estimatedRefund, 1080);
     const secondEndpoint = `https://db.koorta.com/admin/orders/ORD-1/requests/${secondRequest.transactionId}`;
@@ -628,6 +641,10 @@ test("handles a discounted partial return through approval, restock, and refund"
         env,
       );
       assert.equal(response.status, 200);
+      assert.deepEqual(
+        emailRecipients.splice(0),
+        action === "approve" ? [["customer@example.com"]] : [],
+      );
     }
     const secondRefund = await worker.fetch(
       new Request(secondEndpoint, {
@@ -638,6 +655,7 @@ test("handles a discounted partial return through approval, restock, and refund"
       env,
     );
     assert.equal(secondRefund.status, 200);
+    assert.deepEqual(emailRecipients.splice(0), [["customer@example.com"]]);
     assert.equal(bucket.catalog[1].stockBySize.L, 4);
     assert.equal(
       database.prepare("SELECT status FROM orders WHERE order_number = ?").get("ORD-1").status,

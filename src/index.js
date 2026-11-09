@@ -198,10 +198,10 @@ async function sendOrderNotifications(order, env) {
   return results;
 }
 
-async function sendOrderLifecycleNotifications(order, env, event) {
+async function sendOrderLifecycleNotifications(order, env, event, audience = 'both') {
   const safeEvent = escapeHtml(event.title);
   const recipients = [
-    { role: 'admin', email: 'admin@koorta.com' },
+    ...(audience === 'both' ? [{ role: 'admin', email: 'admin@koorta.com' }] : []),
     ...(order.customer.email ? [{ role: 'customer', email: order.customer.email }] : []),
   ];
   const items = (event.items || []).map((item) => `${item.name} — Size ${item.size} × ${item.qty}`);
@@ -1526,15 +1526,16 @@ export default {
           if (Number(update.meta?.changes || 0) !== 1) {
             return buildError('The request changed; reload and try again.', 409, corsHeaders);
           }
-          const emailNotifications = await sendOrderLifecycleNotifications(order, env, {
-            title: metadata.type === 'return' ? 'Return request update' : 'Cancellation request update',
-            message: metadata.type === 'return'
-              ? 'We could not approve the return request. Please contact our team if you need help.'
-              : 'We could not approve the cancellation request. The order remains active.',
-            reason: note || reason,
-            items: itemDetails,
-          });
-          return jsonResponse({ success: true, status: 'rejected', emailNotifications }, 200, corsHeaders);
+          if (metadata.type === 'return') {
+            const emailNotifications = await sendOrderLifecycleNotifications(order, env, {
+              title: 'Return request update',
+              message: 'We could not approve the return request. Please contact our team if you need help.',
+              reason: note || reason,
+              items: itemDetails,
+            }, 'customer');
+            return jsonResponse({ success: true, status: 'rejected', emailNotifications }, 200, corsHeaders);
+          }
+          return jsonResponse({ success: true, status: 'rejected' }, 200, corsHeaders);
         }
 
         if (metadata.type === 'return' && action === 'approve') {
@@ -1556,7 +1557,7 @@ export default {
             amount: Number(row.amount || 0),
             reason,
             items: itemDetails,
-          });
+          }, 'customer');
           return jsonResponse({ success: true, status: 'approved', emailNotifications }, 200, corsHeaders);
         }
 
@@ -1664,16 +1665,7 @@ export default {
           if (Number(finalized[0]?.meta?.changes || 0) !== 1 || Number(finalized[1]?.meta?.changes || 0) !== 1) {
             return buildError('Inventory was restored, but the cancellation ledger could not be finalized. Retry the action to reconcile it.', 409, corsHeaders);
           }
-          const emailNotifications = await sendOrderLifecycleNotifications(order, env, {
-            title: 'Order cancellation approved',
-            message: collectedAmount > 0
-              ? 'Your cancellation is approved. The refund is pending manual processing; our team will notify you after it is sent.'
-              : 'Your cancellation is approved and the order has been cancelled. No payment had been collected, so no refund is due.',
-            ...(collectedAmount > 0 ? { amount: -collectedAmount } : {}),
-            reason,
-            items: order.items.map((item) => ({ name: item.name, size: item.size, qty: item.qty })),
-          });
-          return jsonResponse({ success: true, status: finalStatus, emailNotifications }, 200, corsHeaders);
+          return jsonResponse({ success: true, status: finalStatus }, 200, corsHeaders);
         }
 
         if (metadata.type === 'return' && action === 'receive') {
@@ -1718,16 +1710,7 @@ export default {
           if (Number(update.meta?.changes || 0) !== 1) {
             return buildError('Items were received, but the return ledger could not be finalized. Retry the action to reconcile it.', 409, corsHeaders);
           }
-          const emailNotifications = await sendOrderLifecycleNotifications(order, env, {
-            title: 'Returned items received',
-            message: Number(row.amount) < 0
-              ? 'We received and inspected your returned items. Your refund is pending manual processing.'
-              : 'We received and inspected your returned items. No monetary refund is due for this return.',
-            amount: Number(row.amount),
-            reason,
-            items: itemDetails,
-          });
-          return jsonResponse({ success: true, status: nextStatus, emailNotifications }, 200, corsHeaders);
+          return jsonResponse({ success: true, status: nextStatus }, 200, corsHeaders);
         }
 
         if (action === 'refund') {
@@ -1774,7 +1757,7 @@ export default {
             reference,
             reason,
             items: itemDetails,
-          });
+          }, 'customer');
           return jsonResponse({ success: true, status: 'refunded', emailNotifications }, 200, corsHeaders);
         }
 
