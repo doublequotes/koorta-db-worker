@@ -38,8 +38,14 @@ test("allows credentialed CORS only from configured admin UI origins", () => {
     headers: { origin: "https://untrusted.example" },
   });
 
-  assert.equal(getCorsHeaders(env, allowedRequest, true)["Access-Control-Allow-Origin"], "https://koorta.com");
-  assert.equal(getCorsHeaders(env, allowedRequest, true)["Access-Control-Allow-Credentials"], "true");
+  assert.equal(
+    getCorsHeaders(env, allowedRequest, true)["Access-Control-Allow-Origin"],
+    "https://koorta.com",
+  );
+  assert.equal(
+    getCorsHeaders(env, allowedRequest, true)["Access-Control-Allow-Credentials"],
+    "true",
+  );
   assert.equal(getCorsHeaders(env, blockedRequest, true)["Access-Control-Allow-Origin"], undefined);
 });
 
@@ -153,10 +159,9 @@ test("validates Cloudflare Access JWT signature, issuer, audience, and identity"
 });
 
 test("reports missing Cloudflare Access configuration for admin routes", async () => {
-  const response = await worker.fetch(
-    new Request("https://db.koorta.com/admin/orders"),
-    { ADMIN_UI_ORIGINS: "https://koorta.com" },
-  );
+  const response = await worker.fetch(new Request("https://db.koorta.com/admin/orders"), {
+    ADMIN_UI_ORIGINS: "https://koorta.com",
+  });
   assert.equal(response.status, 503);
 });
 
@@ -176,65 +181,68 @@ test("generates an Access-protected monthly cash report using India time and com
     }
     throw new Error(`Unexpected fetch in test: ${String(input)}`);
   };
-  database.prepare(
-    `INSERT INTO transactions (
+  database
+    .prepare(
+      `INSERT INTO transactions (
       transaction_id, order_number, provider, method, status, amount, external_reference, metadata, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    "payment-nov",
-    "ORD-1",
-    "upi",
-    "upi",
-    "paid",
-    2000,
-    "upi-payment-ref",
-    JSON.stringify({ paymentConfirmedAt: "2026-10-31T18:35:00.000Z" }),
-    "2026-10-31T18:35:00.000Z",
-  );
-  database.prepare(
-    `INSERT INTO transactions (
+    )
+    .run(
+      "payment-nov",
+      "ORD-1",
+      "upi",
+      "upi",
+      "paid",
+      2000,
+      "upi-payment-ref",
+      JSON.stringify({ paymentConfirmedAt: "2026-10-31T18:35:00.000Z" }),
+      "2026-10-31T18:35:00.000Z",
+    );
+  database
+    .prepare(
+      `INSERT INTO transactions (
       transaction_id, order_number, provider, method, status, amount, external_reference, metadata, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    "refund-nov",
-    "ORD-1",
-    "manual",
-    "refund",
-    "refunded",
-    -300,
-    "refund-ref",
-    JSON.stringify({ type: "return", refundedAt: "2026-11-30T18:00:00.000Z" }),
-    "2026-11-30T18:00:00.000Z",
-  );
-  database.prepare(
-    `INSERT INTO transactions (
+    )
+    .run(
+      "refund-nov",
+      "ORD-1",
+      "manual",
+      "refund",
+      "refunded",
+      -300,
+      "refund-ref",
+      JSON.stringify({ type: "return", refundedAt: "2026-11-30T18:00:00.000Z" }),
+      "2026-11-30T18:00:00.000Z",
+    );
+  database
+    .prepare(
+      `INSERT INTO transactions (
       transaction_id, order_number, provider, method, status, amount, metadata, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    "refund-pending",
-    "ORD-1",
-    "manual",
-    "refund",
-    "refund_pending",
-    -500,
-    JSON.stringify({ type: "return" }),
-    "2026-11-15T12:00:00.000Z",
-  );
+    )
+    .run(
+      "refund-pending",
+      "ORD-1",
+      "manual",
+      "refund",
+      "refund_pending",
+      -500,
+      JSON.stringify({ type: "return" }),
+      "2026-11-15T12:00:00.000Z",
+    );
   const env = {
     KOORTA_DB: d1,
     ACCESS_ISSUER: "https://koorta-flow-test.cloudflareaccess.com",
     ACCESS_AUD: "koorta-flow-test-audience",
     ADMIN_UI_ORIGINS: "https://koorta.com",
   };
-  const request = new Request(
-    "https://db.koorta.com/admin/reports/monthly?year=2026&month=11",
-    {
-      headers: {
-        "cf-access-jwt-assertion": accessToken.token,
-        origin: "https://koorta.com",
-      },
+  const request = new Request("https://db.koorta.com/admin/reports/monthly?year=2026&month=11", {
+    headers: {
+      "cf-access-jwt-assertion": accessToken.token,
+      origin: "https://koorta.com",
     },
-  );
+  });
 
   try {
     const response = await worker.fetch(request, env);
@@ -334,7 +342,11 @@ class LocalD1 {
     this.database.exec("BEGIN");
     try {
       const results = [];
-      for (const statement of statements) results.push(await statement.run());
+      for (const statement of statements) {
+        results.push(
+          /^\s*SELECT\b/i.test(statement.query) ? await statement.all() : await statement.run(),
+        );
+      }
       this.database.exec("COMMIT");
       return results;
     } catch (error) {
@@ -487,7 +499,12 @@ test("handles a discounted partial return through approval, restock, and refund"
       return new Response(
         JSON.stringify({
           success: true,
-          action: form.get("response") === "lookup-token" ? "order_lookup" : "order_request",
+          action:
+            form.get("response") === "lookup-token"
+              ? "order_lookup"
+              : form.get("response") === "update-token"
+                ? "order_update"
+                : "order_request",
           hostname: "koorta.com",
         }),
         { status: 200 },
@@ -531,6 +548,8 @@ test("handles a discounted partial return through approval, restock, and refund"
     assert.equal(lookupResponse.status, 200);
     const lookup = await lookupResponse.json();
     assert.equal(lookup.order.customer, undefined);
+    assert.equal(lookup.order.email, "customer@example.com");
+    assert.equal(lookup.order.deliveryNote, "");
     assert.equal(lookup.order.items[0].returnableQty, 1);
 
     const requestResponse = await worker.fetch(
@@ -549,10 +568,7 @@ test("handles a discounted partial return through approval, restock, and refund"
       env,
     );
     assert.equal(requestResponse.status, 201);
-    assert.deepEqual(emailRecipients.splice(0), [
-      ["admin@koorta.com"],
-      ["customer@example.com"],
-    ]);
+    assert.deepEqual(emailRecipients.splice(0), [["admin@koorta.com"], ["customer@example.com"]]);
     const requested = await requestResponse.json();
     const timelineResponse = await worker.fetch(
       new Request("https://db.koorta.com/customer/order-lookup", {
@@ -643,10 +659,7 @@ test("handles a discounted partial return through approval, restock, and refund"
       env,
     );
     assert.equal(secondRequestResponse.status, 201);
-    assert.deepEqual(emailRecipients.splice(0), [
-      ["admin@koorta.com"],
-      ["customer@example.com"],
-    ]);
+    assert.deepEqual(emailRecipients.splice(0), [["admin@koorta.com"], ["customer@example.com"]]);
     const secondRequest = await secondRequestResponse.json();
     assert.equal(secondRequest.estimatedRefund, 1080);
     const secondEndpoint = `https://db.koorta.com/admin/orders/ORD-1/requests/${secondRequest.transactionId}`;
@@ -706,10 +719,77 @@ test("handles a discounted partial return through approval, restock, and refund"
     );
     assert.equal(duplicateResponse.status, 409);
 
-    const unauthorized = await worker.fetch(
-      new Request("https://db.koorta.com/orders/ORD-1"),
+    const invalidEmailResponse = await worker.fetch(
+      new Request("https://db.koorta.com/customer/orders/ORD-1/contact", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          phone: "9820000000",
+          turnstileToken: "update-token",
+          email: "not-an-email",
+          deliveryNote: "",
+        }),
+      }),
       env,
     );
+    assert.equal(invalidEmailResponse.status, 400);
+
+    const contactUpdateResponse = await worker.fetch(
+      new Request("https://db.koorta.com/customer/orders/ORD-1/contact", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          phone: "9820000000",
+          turnstileToken: "update-token",
+          email: "updated@example.com",
+          deliveryNote: "Please call before delivery.",
+        }),
+      }),
+      env,
+    );
+    assert.equal(contactUpdateResponse.status, 200);
+    assert.deepEqual(await contactUpdateResponse.json(), {
+      success: true,
+      email: "updated@example.com",
+      deliveryNote: "Please call before delivery.",
+    });
+    const updatedContact = database
+      .prepare("SELECT customer_email, customer_notes FROM orders WHERE order_number = ?")
+      .get("ORD-1");
+    assert.equal(updatedContact.customer_email, "updated@example.com");
+    assert.equal(updatedContact.customer_notes, "Please call before delivery.");
+    const mismatchedPhoneUpdate = await worker.fetch(
+      new Request("https://db.koorta.com/customer/orders/ORD-1/contact", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          phone: "9999999999",
+          turnstileToken: "update-token",
+          email: "attacker@example.com",
+          deliveryNote: "",
+        }),
+      }),
+      env,
+    );
+    assert.equal(mismatchedPhoneUpdate.status, 404);
+    const refreshedLookupResponse = await worker.fetch(
+      new Request("https://db.koorta.com/customer/order-lookup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          orderNumber: "ORD-1",
+          phone: "9820000000",
+          turnstileToken: "lookup-token",
+        }),
+      }),
+      env,
+    );
+    assert.equal(refreshedLookupResponse.status, 200);
+    const refreshedLookup = await refreshedLookupResponse.json();
+    assert.equal(refreshedLookup.order.email, "updated@example.com");
+    assert.equal(refreshedLookup.order.deliveryNote, "Please call before delivery.");
+
+    const unauthorized = await worker.fetch(new Request("https://db.koorta.com/orders/ORD-1"), env);
     assert.equal(unauthorized.status, 401);
   } finally {
     globalThis.fetch = originalFetch;
