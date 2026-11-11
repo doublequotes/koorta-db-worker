@@ -1211,6 +1211,7 @@ async function advanceShipmentBooking(db, env, order, initialShipment, isReturn,
     try {
       const path = isReturn ? "/orders/create/return" : "/orders/create/adhoc";
       created = await shiprocketRequest(env, path, returnPayload);
+      console.log(`Shiprocket order creation response for ${order.orderNumber}:`, JSON.stringify(created, null, 2));
     } catch (error) {
       return failBooking(error, true);
     }
@@ -2640,6 +2641,7 @@ export default {
                 throw error;
               }
               shipment.external_order_reference = reference;
+              console.log(`shiprocketPayload:`, JSON.stringify(shiprocketPayload, null, 2));
               const result = await advanceShipmentBooking(
                 env.KOORTA_DB,
                 env,
