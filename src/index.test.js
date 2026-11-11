@@ -702,6 +702,68 @@ test("books forward and approved reverse Shiprocket shipments and applies carrie
   }
 });
 
+test("marks a pre-AWB shipment cancelled from an order-ID-only Shiprocket webhook", async () => {
+  const { database, d1 } = createOrderDatabase({
+    orderStatus: "confirmed",
+    paymentStatus: "paid",
+    discount: 0,
+    shipping: 0,
+  });
+  database
+    .prepare(
+      `INSERT INTO order_shipments (
+        id, order_number, direction, external_order_reference, shiprocket_order_id,
+        shiprocket_shipment_id, status, error, created_at, updated_at
+      ) VALUES (?, ?, 'forward', ?, ?, ?, 'booking_error', ?, ?, ?)`,
+    )
+    .run(
+      "shipment-1",
+      "ORD-1",
+      "812230253382",
+      "1721799272",
+      "1717427392",
+      "KYC verification is mandated for your account to ship an order.",
+      new Date().toISOString(),
+      new Date().toISOString(),
+    );
+  const originalConsoleError = console.error;
+  const originalConsoleWarn = console.warn;
+  console.error = () => {};
+  console.warn = () => {};
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://db.koorta.com/webhooks/carrier-events", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": "test-webhook-secret",
+        },
+        body: JSON.stringify({
+          order_id: "1721799272",
+          current_status: "CANCELLED",
+        }),
+      }),
+      {
+        KOORTA_DB: d1,
+        SHIPROCKET_WEBHOOK_SECRET: "test-webhook-secret",
+      },
+    );
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { success: true, matched: true });
+    const shipment = database
+      .prepare("SELECT status, error, last_event FROM order_shipments WHERE id = ?")
+      .get("shipment-1");
+    assert.equal(shipment.status, "cancelled");
+    assert.equal(shipment.error, null);
+    assert.equal(shipment.last_event, "CANCELLED");
+  } finally {
+    console.error = originalConsoleError;
+    console.warn = originalConsoleWarn;
+  }
+});
+
 test("logs and saves Shiprocket create errors without logging response values", async () => {
   const { database, d1 } = createOrderDatabase({
     orderStatus: "confirmed",

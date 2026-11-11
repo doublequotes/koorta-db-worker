@@ -1393,17 +1393,34 @@ function secretsMatch(provided, expected) {
 }
 
 async function applyCarrierWebhook(db, payload) {
+  console.log("Received carrier webhook:", JSON.stringify(payload, null, 2));
   const awb = sanitizeString(payload.awb || payload.awb_code);
   const shipmentId = sanitizeString(payload.shipment_id);
-  if (!awb && !shipmentId) throw new Error("Carrier tracking event has no AWB or shipment ID.");
+  const orderId = sanitizeString(payload.order_id);
+  if (!awb && !shipmentId && !orderId) {
+    throw new Error("Carrier tracking event has no AWB, shipment ID, or order ID.");
+  }
   const shipment = await db
     .prepare(
       `SELECT * FROM order_shipments
        WHERE (? <> '' AND awb = ? AND (? = '' OR shiprocket_shipment_id = ?))
           OR (? = '' AND ? <> '' AND shiprocket_shipment_id = ?)
+          OR (? = '' AND ? = '' AND ? <> '' AND shiprocket_order_id = ?)
        ORDER BY created_at DESC LIMIT 1`,
     )
-    .bind(awb, awb, shipmentId, shipmentId, awb, shipmentId, shipmentId)
+    .bind(
+      awb,
+      awb,
+      shipmentId,
+      shipmentId,
+      awb,
+      shipmentId,
+      shipmentId,
+      awb,
+      shipmentId,
+      orderId,
+      orderId,
+    )
     .first();
   if (!shipment) return false;
 
@@ -1667,6 +1684,14 @@ export default {
           return buildError("Carrier webhook body must be a JSON object.", 400);
         }
         const matched = await applyCarrierWebhook(env.KOORTA_DB, payload);
+        if (!matched) {
+          const carrierStatus = sanitizeString(
+            payload.current_status || payload.shipment_status || payload.status,
+          );
+          console.warn(
+            `Carrier webhook did not match a shipment (status: ${carrierStatus || "unknown"}).`,
+          );
+        }
         return jsonResponse({ success: true, matched }, 200);
       }
 
@@ -3684,8 +3709,11 @@ export default {
 
       return buildError("Not found.", 404, corsHeaders);
     } catch (error) {
-      console.error("Worker exception:", error);
       const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        `Worker exception: ${message}`,
+        error instanceof Error ? { name: error.name, stack: error.stack } : undefined,
+      );
       return buildError(`Internal worker error: ${message}`, 500, corsHeaders);
     }
   },
