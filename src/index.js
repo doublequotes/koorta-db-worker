@@ -54,6 +54,9 @@ function formatCurrency(amount) {
 }
 
 const SHIPROCKET_API_BASE = "https://apiv2.shiprocket.in/v1/external";
+const SHIPROCKET_TOKEN_CACHE_KEY = "shiprocket-auth-token";
+const SHIPROCKET_TOKEN_FALLBACK_TTL_MS = 9 * 24 * 60 * 60 * 1000;
+const SHIPROCKET_TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
 let shiprocketTokenCache = null;
 
 class ShiprocketApiError extends Error {
@@ -92,8 +95,36 @@ async function getShiprocketToken(env, forceRefresh = false) {
   if (!sanitizeString(env.SHIPROCKET_EMAIL) || !sanitizeString(env.SHIPROCKET_PASSWORD)) {
     throw new Error("Shiprocket API credentials are not configured.");
   }
-  if (!forceRefresh && shiprocketTokenCache && shiprocketTokenCache.expiresAt > Date.now()) {
-    return shiprocketTokenCache.token;
+  if (forceRefresh) {
+    shiprocketTokenCache = null;
+    await env.SHIPROCKET_TOKEN_CACHE?.delete(SHIPROCKET_TOKEN_CACHE_KEY);
+  } else {
+    const now = Date.now();
+    if (shiprocketTokenCache && shiprocketTokenCache.expiresAt > now) {
+      return shiprocketTokenCache.token;
+    }
+
+    if (env.SHIPROCKET_TOKEN_CACHE) {
+      const cachedValue = await env.SHIPROCKET_TOKEN_CACHE.get(SHIPROCKET_TOKEN_CACHE_KEY);
+      if (cachedValue) {
+        let cached;
+        try {
+          cached = JSON.parse(cachedValue);
+        } catch {
+          console.warn("Discarding malformed Shiprocket auth token from KV.");
+          await env.SHIPROCKET_TOKEN_CACHE.delete(SHIPROCKET_TOKEN_CACHE_KEY);
+        }
+        if (
+          typeof cached?.token === "string" &&
+          Number.isFinite(cached.expiresAt) &&
+          cached.expiresAt > now
+        ) {
+          shiprocketTokenCache = cached;
+          return cached.token;
+        }
+        if (cached) await env.SHIPROCKET_TOKEN_CACHE.delete(SHIPROCKET_TOKEN_CACHE_KEY);
+      }
+    }
   }
 
   let response;
@@ -119,7 +150,7 @@ async function getShiprocketToken(env, forceRefresh = false) {
     );
   }
 
-  let expiresAt = Date.now() + 30 * 60 * 1000;
+  let expiresAt = Date.now() + SHIPROCKET_TOKEN_FALLBACK_TTL_MS;
   try {
     const encodedClaims = token
       .split(".")[1]
@@ -128,11 +159,23 @@ async function getShiprocketToken(env, forceRefresh = false) {
     const claims = JSON.parse(
       atob(encodedClaims.padEnd(Math.ceil(encodedClaims.length / 4) * 4, "=")),
     );
-    if (Number.isFinite(claims.exp)) expiresAt = Math.max(Date.now(), claims.exp * 1000 - 60_000);
+    if (Number.isFinite(claims.exp)) {
+      expiresAt = claims.exp * 1000 - SHIPROCKET_TOKEN_EXPIRY_SKEW_MS;
+    }
   } catch {
-    // Use a short-lived cache if Shiprocket changes its token format.
+    // Shiprocket documents a 240-hour token TTL; use a shorter fallback for opaque tokens.
   }
-  shiprocketTokenCache = { token, expiresAt };
+  if (expiresAt > Date.now()) {
+    shiprocketTokenCache = { token, expiresAt };
+    if (env.SHIPROCKET_TOKEN_CACHE) {
+      const expirationTtl = Math.ceil((expiresAt - Date.now()) / 1000);
+      await env.SHIPROCKET_TOKEN_CACHE.put(
+        SHIPROCKET_TOKEN_CACHE_KEY,
+        JSON.stringify(shiprocketTokenCache),
+        { expirationTtl },
+      );
+    }
+  }
   return token;
 }
 
@@ -3720,6 +3763,7 @@ export default {
 };
 
 export {
+  getShiprocketToken,
   getCorsHeaders,
   collectReservedReturnQuantities,
   isWithinReturnWindow,

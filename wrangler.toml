@@ -38,6 +38,10 @@ SHIPROCKET_RETURN_PICKUP_EMAIL = "admin@koorta.com"
 binding = "KOORTA_DB"
 database_name = "koorta_db"
 
+[[kv_namespaces]]
+binding = "SHIPROCKET_TOKEN_CACHE"
+id = "b29f9d5d52ed4d08bc5bb7016f44a19a"
+
 [[r2_buckets]]
 binding = "GARMENT_BUCKET"
 bucket_name = "garment-catalog"

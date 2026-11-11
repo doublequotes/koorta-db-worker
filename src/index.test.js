@@ -17,6 +17,52 @@ import {
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
+test("reuses the Shiprocket auth token from KV across Worker isolates", async () => {
+  const cachedValues = new Map();
+  const cacheTtls = [];
+  let authCalls = 0;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const tokenPayload = Buffer.from(JSON.stringify({ exp: nowSeconds + 10 * 24 * 60 * 60 }))
+    .toString("base64url");
+  const token = `header.${tokenPayload}.signature`;
+  const originalFetch = globalThis.fetch;
+  const cache = {
+    async get(key) {
+      return cachedValues.get(key) || null;
+    },
+    async put(key, value, options) {
+      cachedValues.set(key, value);
+      cacheTtls.push(options.expirationTtl);
+    },
+    async delete(key) {
+      cachedValues.delete(key);
+    },
+  };
+  globalThis.fetch = async (input) => {
+    assert.equal(String(input), "https://apiv2.shiprocket.in/v1/external/auth/login");
+    authCalls += 1;
+    return new Response(JSON.stringify({ token }), { status: 200 });
+  };
+
+  try {
+    const env = {
+      SHIPROCKET_EMAIL: "worker@example.test",
+      SHIPROCKET_PASSWORD: "test-password",
+      SHIPROCKET_TOKEN_CACHE: cache,
+    };
+    const firstIsolate = await import("./index.js?shiprocket-kv-first-isolate");
+    assert.equal(await firstIsolate.getShiprocketToken(env, true), token);
+    assert.equal(authCalls, 1);
+    assert.ok(Math.abs(cacheTtls[0] - (10 * 24 * 60 * 60 - 60)) <= 1);
+
+    const secondIsolate = await import("./index.js?shiprocket-kv-second-isolate");
+    assert.equal(await secondIsolate.getShiprocketToken(env), token);
+    assert.equal(authCalls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("normalizes Indian phone numbers consistently", () => {
   assert.equal(normalizePhone("+91 98200 00000"), "9820000000");
   assert.equal(normalizePhone("98200-00000"), "9820000000");
