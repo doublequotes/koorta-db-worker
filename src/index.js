@@ -53,6 +53,279 @@ function formatCurrency(amount) {
   return `₹${Number(amount).toLocaleString("en-IN")}`;
 }
 
+const SHIPROCKET_API_BASE = "https://apiv2.shiprocket.in/v1/external";
+let shiprocketTokenCache = null;
+
+class ShiprocketApiError extends Error {
+  constructor(message, status = 0) {
+    super(message);
+    this.name = "ShiprocketApiError";
+    this.status = status;
+  }
+}
+
+function randomNumericReference() {
+  const digits = new Uint8Array(6);
+  crypto.getRandomValues(digits);
+  return `${String(Date.now()).slice(-6)}${Array.from(digits, (digit) => digit % 10).join("")}`;
+}
+
+function getShiprocketDimensions(env) {
+  const dimensions = {
+    length: Number(env.SHIPROCKET_PARCEL_LENGTH),
+    breadth: Number(env.SHIPROCKET_PARCEL_BREADTH),
+    height: Number(env.SHIPROCKET_PARCEL_HEIGHT),
+    weight: Number(env.SHIPROCKET_PARCEL_WEIGHT),
+  };
+  if (
+    !sanitizeString(env.SHIPROCKET_PICKUP_LOCATION) ||
+    Object.values(dimensions).some((value) => !Number.isFinite(value) || value <= 0)
+  ) {
+    throw new Error(
+      "Configure the Shiprocket pickup location and positive parcel length, breadth, height, and weight before booking.",
+    );
+  }
+  return dimensions;
+}
+
+async function getShiprocketToken(env, forceRefresh = false) {
+  if (!sanitizeString(env.SHIPROCKET_EMAIL) || !sanitizeString(env.SHIPROCKET_PASSWORD)) {
+    throw new Error("Shiprocket API credentials are not configured.");
+  }
+  if (!forceRefresh && shiprocketTokenCache && shiprocketTokenCache.expiresAt > Date.now()) {
+    return shiprocketTokenCache.token;
+  }
+
+  let response;
+  try {
+    response = await fetch(`${SHIPROCKET_API_BASE}/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email: env.SHIPROCKET_EMAIL,
+        password: env.SHIPROCKET_PASSWORD,
+      }),
+    });
+  } catch {
+    throw new ShiprocketApiError("Could not connect to Shiprocket authentication.", 0);
+  }
+
+  const data = await response.json().catch(() => null);
+  const token = sanitizeString(data?.token);
+  if (!response.ok || !token) {
+    throw new ShiprocketApiError(
+      sanitizeString(data?.message) || "Shiprocket authentication failed.",
+      response.status,
+    );
+  }
+
+  let expiresAt = Date.now() + 30 * 60 * 1000;
+  try {
+    const encodedClaims = token
+      .split(".")[1]
+      .replace(/-/g, "+")
+      .replace(/_/g, "/");
+    const claims = JSON.parse(
+      atob(encodedClaims.padEnd(Math.ceil(encodedClaims.length / 4) * 4, "=")),
+    );
+    if (Number.isFinite(claims.exp)) expiresAt = Math.max(Date.now(), claims.exp * 1000 - 60_000);
+  } catch {
+    // Use a short-lived cache if Shiprocket changes its token format.
+  }
+  shiprocketTokenCache = { token, expiresAt };
+  return token;
+}
+
+async function shiprocketRequest(env, path, body, method = "POST") {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const token = await getShiprocketToken(env, attempt === 1);
+    let response;
+    try {
+      response = await fetch(`${SHIPROCKET_API_BASE}${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...(body ? { "content-type": "application/json" } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+    } catch {
+      throw new ShiprocketApiError("Could not connect to Shiprocket.", 0);
+    }
+
+    const data = await response.json().catch(() => null);
+    if (response.status === 401 && attempt === 0) continue;
+    if (!response.ok) {
+      const fieldErrors =
+        data?.errors && typeof data.errors === "object"
+          ? Object.entries(data.errors)
+              .map(([field, messages]) =>
+                `${field}: ${Array.isArray(messages) ? messages.join(", ") : String(messages)}`,
+              )
+              .join("; ")
+          : "";
+      throw new ShiprocketApiError(
+        [
+          sanitizeString(data?.message) || "Shiprocket rejected the shipment request.",
+          fieldErrors,
+        ]
+          .filter(Boolean)
+          .join(" — "),
+        response.status,
+      );
+    }
+    return data;
+  }
+  throw new ShiprocketApiError("Shiprocket authorization failed.", 401);
+}
+
+function getShipmentResult(data) {
+  return data?.response?.data || data?.data || data || {};
+}
+
+function mapCarrierStatus(status) {
+  const normalized = sanitizeString(status).toLowerCase();
+  if (!normalized) return { status: "tracking_update", orderStatus: null };
+  if (/rto.*delivered|return to origin.*(received|delivered)/.test(normalized)) {
+    return { status: "rto_received", orderStatus: null };
+  }
+  if (/rto|return to origin|returned to origin/.test(normalized)) {
+    return { status: "rto_in_transit", orderStatus: null };
+  }
+  if (/delivered/.test(normalized)) return { status: "delivered", orderStatus: "delivered" };
+  if (/picked.?up|in transit|out for delivery|shipped|manifest/.test(normalized)) {
+    return { status: "in_transit", orderStatus: "shipped" };
+  }
+  if (/cancel/.test(normalized)) return { status: "cancelled", orderStatus: null };
+  if (/ndr|delivery attempt|undelivered|exception/.test(normalized)) {
+    return { status: "delivery_exception", orderStatus: null };
+  }
+  return { status: "tracking_update", orderStatus: null };
+}
+
+function parseCarrierTimestamp(value) {
+  const timestamp = sanitizeString(value);
+  if (!timestamp) return null;
+  const match = timestamp.match(
+    /^(\d{1,2})[ -](\d{1,2})[ -](\d{4})[ T](\d{2}):(\d{2}):(\d{2})$/,
+  );
+  if (match) {
+    const [, day, month, year, hour, minute, second] = match;
+    const calendarDate = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+    if (
+      calendarDate.getUTCFullYear() !== Number(year) ||
+      calendarDate.getUTCMonth() !== Number(month) - 1 ||
+      calendarDate.getUTCDate() !== Number(day) ||
+      Number(hour) > 23 ||
+      Number(minute) > 59 ||
+      Number(second) > 59
+    ) {
+      return null;
+    }
+    return new Date(
+      Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute) - 330, Number(second)),
+    ).toISOString();
+  }
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+function shipmentDto(row) {
+  return {
+    id: row.id,
+    direction: row.direction,
+    returnTransactionId: row.return_transaction_id || null,
+    awb: row.awb || "",
+    courier: row.courier_name || "",
+    status: row.status,
+    lastEvent: row.last_event || "",
+    manifestUrl: row.manifest_url || "",
+    error: row.error || "",
+    manual: Boolean(row.manual),
+    deliveredAt: row.delivered_at || null,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function getOrderShipments(db, orderNumber) {
+  const result = await db
+    .prepare("SELECT * FROM order_shipments WHERE order_number = ? ORDER BY created_at")
+    .bind(orderNumber)
+    .all();
+  return (result.results || []).map(shipmentDto);
+}
+
+function splitCustomerName(name) {
+  const parts = sanitizeString(name).split(/\s+/).filter(Boolean);
+  return {
+    first: parts.shift() || "Customer",
+    last: parts.join(" "),
+  };
+}
+
+function requireReturnAddress(env) {
+  const address = {
+    name: sanitizeString(env.SHIPROCKET_RETURN_NAME),
+    address: sanitizeString(env.SHIPROCKET_RETURN_ADDRESS),
+    city: sanitizeString(env.SHIPROCKET_RETURN_CITY),
+    state: sanitizeString(env.SHIPROCKET_RETURN_STATE),
+    pincode: sanitizeString(env.SHIPROCKET_RETURN_PINCODE),
+    phone: sanitizeString(env.SHIPROCKET_RETURN_PHONE),
+    email: sanitizeString(env.SHIPROCKET_RETURN_EMAIL),
+  };
+  if (Object.values(address).some((value) => !value)) {
+    throw new Error(
+      "Configure the Shiprocket return address, contact phone, and email before booking a reverse pickup.",
+    );
+  }
+  if (!/^\d{6}$/.test(address.pincode) || !/^\+?\d{10,15}$/.test(address.phone.replace(/[\s()-]/g, ""))) {
+    throw new Error("The Shiprocket return address PIN code or phone number is invalid.");
+  }
+  return address;
+}
+
+function makeShiprocketOrderPayload(order, reference, env) {
+  const dimensions = getShiprocketDimensions(env);
+  const customerName = splitCustomerName(order.customer.name);
+  const paidAmount = order.transactions
+    .filter((transaction) => transaction.status === "paid" && transaction.amount > 0)
+    .reduce((sum, transaction) => sum + transaction.amount, 0);
+  const prepaid = paidAmount >= order.total;
+  return {
+    order_id: reference,
+    order_date: new Date(order.placedAt).toISOString().slice(0, 10),
+    pickup_location: sanitizeString(env.SHIPROCKET_PICKUP_LOCATION),
+    comment: `Koorta order ${order.orderNumber}`,
+    billing_customer_name: customerName.first,
+    billing_last_name: customerName.last,
+    billing_address: order.customer.address,
+    billing_address_2: order.customer.postOffice || "",
+    billing_isd_code: "91",
+    billing_city: order.customer.city,
+    billing_pincode: Number(order.customer.pincode),
+    billing_state: order.customer.state,
+    billing_country: "India",
+    billing_email: order.customer.email || sanitizeString(env.SHIPROCKET_RETURN_EMAIL) || "admin@koorta.com",
+    billing_phone: order.customer.phone.replace(/\D/g, "").slice(-10),
+    shipping_is_billing: true,
+    order_items: order.items.map((item) => ({
+      name: item.name,
+      sku: item.id,
+      units: item.qty,
+      selling_price: item.price,
+      discount: 0,
+      tax: 0,
+    })),
+    payment_method: prepaid ? "Prepaid" : "COD",
+    shipping_charges: order.shipping,
+    giftwrap_charges: 0,
+    transaction_charges: 0,
+    total_discount: order.discount,
+    sub_total: order.subtotal,
+    ...dimensions,
+  };
+}
+
 function getOrderEmailContent(order, audience) {
   const isAdmin = audience === "admin";
   const itemRows = order.items
@@ -721,6 +994,7 @@ async function getOrder(db, orderNumber) {
     )
     .bind(orderNumber)
     .all();
+  const shipments = await getOrderShipments(db, orderNumber);
 
   return {
     orderNumber: orderResult.order_number,
@@ -746,6 +1020,7 @@ async function getOrder(db, orderNumber) {
     total: orderResult.total,
     status: orderResult.status,
     deliveredAt: orderResult.delivered_at || null,
+    shipments,
     items: (itemsResult?.results || []).map((item) => ({
       id: item.item_id,
       name: item.name,
@@ -766,6 +1041,347 @@ async function getOrder(db, orderNumber) {
       updatedAt: t.updated_at,
     })),
   };
+}
+
+async function saveShipment(db, shipmentId, updates) {
+  const allowedColumns = new Set([
+    "shiprocket_order_id",
+    "shiprocket_shipment_id",
+    "awb",
+    "courier_name",
+    "status",
+    "last_event",
+    "manifest_url",
+    "error",
+    "manual",
+    "delivered_at",
+  ]);
+  const entries = Object.entries(updates).filter(([column]) => allowedColumns.has(column));
+  if (entries.length === 0) return;
+  const updatedAt = nowISOString();
+  const assignments = entries.map(([column]) => `${column} = ?`);
+  assignments.push("updated_at = ?");
+  await db
+    .prepare(`UPDATE order_shipments SET ${assignments.join(", ")} WHERE id = ?`)
+    .bind(...entries.map(([, value]) => value), updatedAt, shipmentId)
+    .run();
+}
+
+async function findShipment(db, orderNumber, direction, returnTransactionId = null) {
+  const query =
+    direction === "reverse"
+      ? "SELECT * FROM order_shipments WHERE order_number = ? AND direction = 'reverse' AND return_transaction_id = ?"
+      : "SELECT * FROM order_shipments WHERE order_number = ? AND direction = 'forward'";
+  return db.prepare(query).bind(orderNumber, ...(direction === "reverse" ? [returnTransactionId] : [])).first();
+}
+
+async function createShipmentRecord(
+  db,
+  orderNumber,
+  direction,
+  returnTransactionId = null,
+  allowedOrderStatuses = null,
+  externalOrderReference = randomNumericReference(),
+) {
+  const id = crypto.randomUUID();
+  const now = nowISOString();
+  const statusGuard = Array.isArray(allowedOrderStatuses) && allowedOrderStatuses.length > 0;
+  const result = await db
+    .prepare(
+      `INSERT INTO order_shipments (
+        id, order_number, direction, return_transaction_id, external_order_reference,
+        status, created_at, updated_at
+      )
+       ${statusGuard
+         ? `SELECT ?, ?, ?, ?, ?, 'creating_order', ?, ?
+            WHERE EXISTS (
+              SELECT 1 FROM orders WHERE order_number = ?
+                AND status IN (${allowedOrderStatuses.map(() => "?").join(",")})
+            )`
+         : "VALUES (?, ?, ?, ?, ?, 'creating_order', ?, ?)"} `,
+    )
+    .bind(
+      id,
+      orderNumber,
+      direction,
+      returnTransactionId,
+      externalOrderReference,
+      now,
+      now,
+      ...(statusGuard ? [orderNumber, ...allowedOrderStatuses] : []),
+    )
+    .run();
+  if (Number(result.meta?.changes || 0) !== 1) {
+    throw new Error("Order status changed before the shipment could be reserved.");
+  }
+  return findShipment(db, orderNumber, direction, returnTransactionId);
+}
+
+function getExternalIds(data) {
+  const result = getShipmentResult(data);
+  return {
+    orderId: result.order_id === undefined ? "" : String(result.order_id),
+    shipmentId: result.shipment_id === undefined ? "" : String(result.shipment_id),
+  };
+}
+
+async function advanceShipmentBooking(db, env, order, initialShipment, isReturn, returnPayload) {
+  let shipment = initialShipment;
+  if (["booked", "delivered", "in_transit", "rto_in_transit", "delivery_exception"].includes(shipment.status)) {
+    return shipmentDto(shipment);
+  }
+  if (shipment.status === "booking_uncertain" || shipment.status === "booking_failed") {
+    throw new Error(
+      "Shiprocket order creation did not complete cleanly. Check Shiprocket before retrying; you can use the manual tracking controls here.",
+    );
+  }
+
+  const failBooking = async (error, creatingOrder = false) => {
+    const status =
+      creatingOrder &&
+      error instanceof ShiprocketApiError &&
+      (error.status === 0 || error.status >= 500)
+        ? "booking_uncertain"
+        : creatingOrder
+          ? "booking_failed"
+          : "booking_error";
+    const message = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+    await saveShipment(db, shipment.id, { status, error: message });
+    throw new Error(message);
+  };
+
+  if (!shipment.shiprocket_shipment_id) {
+    if (shipment.status !== "creating_order") {
+      throw new Error(
+        "The Shiprocket order could not be resumed safely. Check Shiprocket and use the manual tracking controls.",
+      );
+    }
+    const claim = await db
+      .prepare(
+        `UPDATE order_shipments SET status = 'order_creation_in_progress', updated_at = ?
+         WHERE id = ? AND status = 'creating_order'`,
+      )
+      .bind(nowISOString(), shipment.id)
+      .run();
+    if (Number(claim.meta?.changes || 0) !== 1) {
+      throw new Error("Shipment booking is already in progress or requires manual review.");
+    }
+    let created;
+    try {
+      const path = isReturn ? "/orders/create/return" : "/orders/create/adhoc";
+      created = await shiprocketRequest(env, path, returnPayload);
+    } catch (error) {
+      return failBooking(error, true);
+    }
+    const ids = getExternalIds(created);
+    if (!ids.shipmentId) {
+      await saveShipment(db, shipment.id, {
+        shiprocket_order_id: ids.orderId || null,
+        status: "booking_uncertain",
+        error: "Shiprocket did not return a shipment ID. Verify the order in Shiprocket before proceeding.",
+      });
+      throw new Error(
+        "Shiprocket did not return a shipment ID. Verify the order in Shiprocket before proceeding.",
+      );
+    }
+    await saveShipment(db, shipment.id, {
+      shiprocket_order_id: ids.orderId || null,
+      shiprocket_shipment_id: ids.shipmentId,
+      status: "order_created",
+      error: null,
+    });
+    shipment = await findShipment(db, order.orderNumber, isReturn ? "reverse" : "forward", shipment.return_transaction_id);
+  }
+
+  if (!shipment.awb) {
+    try {
+      const awbData = await shiprocketRequest(env, "/courier/assign/awb", {
+        shipment_id: Number(shipment.shiprocket_shipment_id),
+        ...(isReturn ? { is_return: 1 } : {}),
+      });
+      const result = getShipmentResult(awbData);
+      const awb = sanitizeString(result.awb_code);
+      if (!awb) throw new Error("Shiprocket did not return an AWB.");
+      await saveShipment(db, shipment.id, {
+        awb,
+        courier_name: sanitizeString(result.courier_name),
+        status: "awb_assigned",
+        error: null,
+      });
+      shipment = await findShipment(db, order.orderNumber, isReturn ? "reverse" : "forward", shipment.return_transaction_id);
+    } catch (error) {
+      return failBooking(error);
+    }
+  }
+
+  if (!["pickup_requested", "booked"].includes(shipment.status)) {
+    try {
+      await shiprocketRequest(env, "/courier/generate/pickup", {
+        shipment_id: [Number(shipment.shiprocket_shipment_id)],
+      });
+      await saveShipment(db, shipment.id, { status: "pickup_requested", error: null });
+      shipment = await findShipment(db, order.orderNumber, isReturn ? "reverse" : "forward", shipment.return_transaction_id);
+    } catch (error) {
+      return failBooking(error);
+    }
+  }
+
+  if (!shipment.manifest_url) {
+    try {
+      const manifest = await shiprocketRequest(env, "/manifests/generate", {
+        shipment_id: [Number(shipment.shiprocket_shipment_id)],
+      });
+      await saveShipment(db, shipment.id, {
+        manifest_url: sanitizeString(manifest?.manifest_url) || null,
+        status: "booked",
+        error: null,
+      });
+    } catch (error) {
+      return failBooking(error);
+    }
+  }
+
+  return shipmentDto(await findShipment(db, order.orderNumber, isReturn ? "reverse" : "forward", shipment.return_transaction_id));
+}
+
+function makeShiprocketReturnPayload(order, shipment, transactionId, env) {
+  const returnAddress = requireReturnAddress(env);
+  const dimensions = getShiprocketDimensions(env);
+  const transaction = order.transactions.find((item) => item.transactionId === transactionId);
+  if (!transaction || transaction.status !== "approved" || transaction.metadata?.type !== "return") {
+    throw new Error("Only an approved customer return can be booked for reverse pickup.");
+  }
+  const selectedItems = Array.isArray(transaction.metadata.items) ? transaction.metadata.items : [];
+  const items = selectedItems.map((selection) => {
+    const item = order.items.find(
+      (candidate) =>
+        String(candidate.id) === String(selection.itemId) &&
+        candidate.size === String(selection.size),
+    );
+    if (!item || !Number.isInteger(Number(selection.qty)) || Number(selection.qty) <= 0) {
+      throw new Error("The approved return contains an invalid item selection.");
+    }
+    return {
+      sku: item.id,
+      name: `${item.name} - ${item.size}`,
+      units: Number(selection.qty),
+      selling_price: item.price,
+      discount: 0,
+      qc_enable: true,
+      hsn: "",
+      brand: "Koorta",
+      qc_size: item.size,
+    };
+  });
+  if (items.length === 0) throw new Error("The approved return has no items to collect.");
+  const customerName = splitCustomerName(order.customer.name);
+  const returnPhone = returnAddress.phone.replace(/\D/g, "").slice(-10);
+  const pickupEmail =
+    order.customer.email || sanitizeString(env.SHIPROCKET_RETURN_PICKUP_EMAIL) || returnAddress.email;
+  const itemSubtotal = order.items.reduce((sum, item) => {
+    const selection = selectedItems.find(
+      (candidate) =>
+        String(candidate.itemId) === String(item.id) && String(candidate.size) === item.size,
+    );
+    return sum + (selection ? item.price * Number(selection.qty) : 0);
+  }, 0);
+  return {
+    order_id: shipment.external_order_reference,
+    order_date: new Date().toISOString().slice(0, 10),
+    pickup_customer_name: customerName.first,
+    pickup_last_name: customerName.last,
+    pickup_address: order.customer.address,
+    pickup_address_2: order.customer.postOffice || "",
+    pickup_city: order.customer.city,
+    pickup_state: order.customer.state,
+    pickup_country: "India",
+    pickup_pincode: Number(order.customer.pincode),
+    pickup_email: pickupEmail,
+    pickup_phone: order.customer.phone.replace(/\D/g, "").slice(-10),
+    pickup_isd_code: "91",
+    shipping_customer_name: returnAddress.name,
+    shipping_address: returnAddress.address,
+    shipping_address_2: "",
+    shipping_city: returnAddress.city,
+    shipping_country: "India",
+    shipping_pincode: Number(returnAddress.pincode),
+    shipping_state: returnAddress.state,
+    shipping_email: returnAddress.email,
+    shipping_isd_code: "91",
+    shipping_phone: returnPhone,
+    order_items: items,
+    payment_method: "PREPAID",
+    total_discount: 0,
+    sub_total: itemSubtotal,
+    ...dimensions,
+  };
+}
+
+function secretsMatch(provided, expected) {
+  const providedBytes = new TextEncoder().encode(String(provided || ""));
+  const expectedBytes = new TextEncoder().encode(String(expected || ""));
+  if (!expectedBytes.length || providedBytes.length !== expectedBytes.length) return false;
+  let mismatch = 0;
+  for (let index = 0; index < expectedBytes.length; index += 1) {
+    mismatch |= providedBytes[index] ^ expectedBytes[index];
+  }
+  return mismatch === 0;
+}
+
+async function applyCarrierWebhook(db, payload) {
+  const awb = sanitizeString(payload.awb || payload.awb_code);
+  const shipmentId = sanitizeString(payload.shipment_id);
+  if (!awb && !shipmentId) throw new Error("Carrier tracking event has no AWB or shipment ID.");
+  const shipment = await db
+    .prepare(
+      `SELECT * FROM order_shipments
+       WHERE (? <> '' AND awb = ? AND (? = '' OR shiprocket_shipment_id = ?))
+          OR (? = '' AND ? <> '' AND shiprocket_shipment_id = ?)
+       ORDER BY created_at DESC LIMIT 1`,
+    )
+    .bind(awb, awb, shipmentId, shipmentId, awb, shipmentId, shipmentId)
+    .first();
+  if (!shipment) return false;
+
+  const carrierStatus = sanitizeString(payload.current_status || payload.shipment_status || payload.status);
+  const mapped = mapCarrierStatus(carrierStatus);
+  const eventTime = sanitizeString(payload.current_timestamp || payload.updated_at);
+  const location = sanitizeString(payload.destination || payload.location);
+  const lastEvent = [carrierStatus, location, eventTime].filter(Boolean).join(" · ").slice(0, 500);
+  const keepTerminalStatus =
+    (shipment.status === "cancelled" && mapped.status !== "cancelled") ||
+    (shipment.status === "rto_received" && mapped.status !== "rto_received") ||
+    (shipment.status === "delivered" &&
+      !["delivered", "rto_in_transit", "rto_received"].includes(mapped.status));
+  const nextShipmentStatus = keepTerminalStatus ? shipment.status : mapped.status;
+  const deliveredAt =
+    nextShipmentStatus === "delivered"
+      ? shipment.delivered_at ||
+        parseCarrierTimestamp(eventTime) ||
+        nowISOString()
+      : shipment.delivered_at || null;
+  await saveShipment(db, shipment.id, {
+    awb: awb || shipment.awb,
+    courier_name: sanitizeString(payload.courier_name) || shipment.courier_name,
+    status: nextShipmentStatus,
+    last_event: lastEvent || carrierStatus || "Tracking update received",
+    delivered_at: deliveredAt,
+    error: null,
+  });
+
+  if (shipment.direction === "forward" && !keepTerminalStatus && mapped.orderStatus) {
+    const nextStatus = mapped.orderStatus;
+    await db
+      .prepare(
+        `UPDATE orders
+         SET status = ?, delivered_at = CASE WHEN ? = 'delivered' THEN COALESCE(delivered_at, ?) ELSE delivered_at END,
+             updated_at = ?
+         WHERE order_number = ? AND status IN (${nextStatus === "delivered" ? "'confirmed', 'shipped'" : "'confirmed'"})`,
+      )
+      .bind(nextStatus, nextStatus, deliveredAt, nowISOString(), shipment.order_number)
+      .run();
+  }
+  return true;
 }
 
 async function readCatalog(bucket) {
@@ -965,6 +1581,29 @@ export default {
 
       if (!env.KOORTA_DB && route !== "/contact" && route !== "/wholesale-enquiry") {
         return buildError("D1 binding KOORTA_DB is not configured.", 500, corsHeaders);
+      }
+
+      if (route === "/webhooks/carrier-events") {
+        if (method !== "POST") {
+          return buildError("Method not allowed.", 405, corsHeaders);
+        }
+        if (!sanitizeString(env.SHIPROCKET_WEBHOOK_SECRET)) {
+          return buildError("Carrier webhook authentication is not configured.", 503);
+        }
+        if (
+          !secretsMatch(
+            request.headers.get("x-api-key"),
+            env.SHIPROCKET_WEBHOOK_SECRET,
+          )
+        ) {
+          return buildError("Unauthorized carrier webhook.", 401);
+        }
+        const payload = await parseJson(request);
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+          return buildError("Carrier webhook body must be a JSON object.", 400);
+        }
+        const matched = await applyCarrierWebhook(env.KOORTA_DB, payload);
+        return jsonResponse({ success: true, matched }, 200);
       }
 
       if (route === "/wholesale-enquiry" && !env.GARMENT_BUCKET) {
@@ -1329,16 +1968,28 @@ export default {
 
         const orderRow = await findCustomerOrder(env.KOORTA_DB, orderNumber, phone);
         if (!orderRow) return buildError("Order number or phone did not match.", 404, corsHeaders);
-        const [itemsResult, transactionsResult] = await env.KOORTA_DB.batch([
+        const [itemsResult, transactionsResult, shipmentsResult] = await env.KOORTA_DB.batch([
           env.KOORTA_DB.prepare(
             "SELECT item_id, name, size, quantity, price FROM order_items WHERE order_number = ? ORDER BY id",
           ).bind(orderNumber),
           env.KOORTA_DB.prepare(
             "SELECT transaction_id, status, amount, metadata, created_at FROM transactions WHERE order_number = ?",
           ).bind(orderNumber),
+          env.KOORTA_DB.prepare(
+            `SELECT id, direction, return_transaction_id, awb, courier_name, status, last_event,
+                    manual, delivered_at, updated_at
+             FROM order_shipments WHERE order_number = ?`,
+          ).bind(orderNumber),
         ]);
         const items = itemsResult.results || [];
         const transactions = transactionsResult.results || [];
+        const shipments = (shipmentsResult.results || []).map(shipmentDto);
+        const forwardShipment = shipments.find((shipment) => shipment.direction === "forward");
+        const reverseShipments = new Map(
+          shipments
+            .filter((shipment) => shipment.direction === "reverse")
+            .map((shipment) => [shipment.returnTransactionId, shipment]),
+        );
         const reserved = collectReservedReturnQuantities(transactions);
         const paidAmount = transactions
           .filter((transaction) => transaction.status === "paid" && transaction.amount > 0)
@@ -1356,6 +2007,15 @@ export default {
               placedAt: orderRow.placed_at,
               status: orderRow.status,
               deliveredAt: orderRow.delivered_at || null,
+              shipment: forwardShipment
+                ? {
+                    awb: forwardShipment.awb,
+                    courier: forwardShipment.courier,
+                    status: forwardShipment.status,
+                    lastEvent: forwardShipment.lastEvent,
+                    manual: forwardShipment.manual,
+                  }
+                : null,
               total: orderRow.total,
               payment: orderRow.payment_method,
               paymentReceived: paidAmount >= orderRow.total,
@@ -1382,6 +2042,15 @@ export default {
                   approvedAt: metadata.approvedAt || null,
                   receivedAt: metadata.receivedAt || metadata.inventoryRestoredAt || null,
                   refundedAt: metadata.refundedAt || null,
+                  shipment: reverseShipments.has(transactionId)
+                    ? {
+                        awb: reverseShipments.get(transactionId).awb,
+                        courier: reverseShipments.get(transactionId).courier,
+                        status: reverseShipments.get(transactionId).status,
+                        lastEvent: reverseShipments.get(transactionId).lastEvent,
+                        manual: reverseShipments.get(transactionId).manual,
+                      }
+                    : null,
                 })),
               items: items.map((item) => {
                 const isNonReturnable =
@@ -1766,6 +2435,255 @@ export default {
           return buildError("Request body must be a JSON object.", 400, corsHeaders);
         }
 
+        if (parts.length === 4 && parts[3] === "shipping") {
+          const order = await getOrder(env.KOORTA_DB, orderNumber);
+          if (!order) return buildError("Order not found.", 404, corsHeaders);
+          const action = sanitizeString(payload.action);
+          const direction = payload.direction === "reverse" ? "reverse" : "forward";
+          const returnTransactionId = sanitizeString(payload.transactionId);
+
+          if (action === "cancel") {
+            if (direction !== "forward" || order.status !== "confirmed") {
+              return buildError("Only a confirmed forward shipment can be cancelled before dispatch.", 409, corsHeaders);
+            }
+            const shipment = await findShipment(env.KOORTA_DB, orderNumber, "forward");
+            if (!shipment || !shipment.shiprocket_order_id) {
+              return buildError("No Shiprocket order ID is available to cancel. Verify the carrier dashboard and record the manual outcome.", 409, corsHeaders);
+            }
+            if (
+              ![
+                "creating_order",
+                "order_creation_in_progress",
+                "order_created",
+                "awb_assigned",
+                "pickup_requested",
+                "booked",
+                "booking_error",
+                "booking_failed",
+                "booking_uncertain",
+              ].includes(shipment.status)
+            ) {
+              return buildError("This shipment may already be with the courier and cannot be cancelled from here.", 409, corsHeaders);
+            }
+            try {
+              await shiprocketRequest(env, "/orders/cancel", {
+                ids: [Number(shipment.shiprocket_order_id)],
+              });
+              await saveShipment(env.KOORTA_DB, shipment.id, {
+                status: "cancelled",
+                last_event: "Shiprocket shipment cancelled by admin before dispatch",
+                error: null,
+              });
+              return jsonResponse(
+                {
+                  success: true,
+                  shipment: shipmentDto(
+                    await findShipment(env.KOORTA_DB, orderNumber, "forward"),
+                  ),
+                },
+                200,
+                corsHeaders,
+              );
+            } catch (error) {
+              return buildError(
+                error instanceof Error ? error.message : "Unable to cancel the Shiprocket order.",
+                502,
+                corsHeaders,
+              );
+            }
+          }
+
+          if (action === "manual_cancel") {
+            if (direction !== "forward" || order.status !== "confirmed") {
+              return buildError("Only a confirmed forward shipment can be marked manually cancelled.", 409, corsHeaders);
+            }
+            const shipment = await findShipment(env.KOORTA_DB, orderNumber, "forward");
+            if (!shipment) return buildError("No forward shipment record was found.", 404, corsHeaders);
+            await saveShipment(env.KOORTA_DB, shipment.id, {
+              status: "cancelled",
+              last_event: "Admin confirmed manual cancellation with the carrier",
+              manual: 1,
+              error: null,
+            });
+            return jsonResponse(
+              {
+                success: true,
+                shipment: shipmentDto(
+                  await findShipment(env.KOORTA_DB, orderNumber, "forward"),
+                ),
+              },
+              200,
+              corsHeaders,
+            );
+          }
+
+          if (action === "book") {
+            if (!sanitizeString(env.SHIPROCKET_EMAIL) || !sanitizeString(env.SHIPROCKET_PASSWORD)) {
+              return buildError("Shiprocket API credentials are not configured.", 503, corsHeaders);
+            }
+            if (direction === "forward" && order.status !== "confirmed") {
+              return buildError("Only a confirmed order can be booked for forward delivery.", 409, corsHeaders);
+            }
+            if (direction === "reverse") {
+              try {
+                makeShiprocketReturnPayload(
+                  order,
+                  { external_order_reference: "1000000000000000" },
+                  returnTransactionId,
+                  env,
+                );
+              } catch (error) {
+                return buildError(error instanceof Error ? error.message : String(error), 400, corsHeaders);
+              }
+            }
+
+            const existing = await findShipment(
+              env.KOORTA_DB,
+              orderNumber,
+              direction,
+              returnTransactionId,
+            );
+            if (existing) {
+              if (["booked", "in_transit", "delivered", "rto_in_transit", "delivery_exception"].includes(existing.status)) {
+                return jsonResponse({ success: true, shipment: shipmentDto(existing) }, 200, corsHeaders);
+              }
+              return buildError(
+                "A shipment record already exists. Review Shiprocket and use the manual tracking controls rather than creating a duplicate.",
+                409,
+                corsHeaders,
+              );
+            }
+
+            let shipment;
+            try {
+              const reference = randomNumericReference();
+              const shiprocketPayload =
+                direction === "reverse"
+                  ? makeShiprocketReturnPayload(
+                      order,
+                      { external_order_reference: reference },
+                      returnTransactionId,
+                      env,
+                    )
+                  : makeShiprocketOrderPayload(order, reference, env);
+              try {
+                shipment = await createShipmentRecord(
+                  env.KOORTA_DB,
+                  orderNumber,
+                  direction,
+                  direction === "reverse" ? returnTransactionId : null,
+                  direction === "forward" ? ["confirmed"] : null,
+                  reference,
+                );
+              } catch (error) {
+                const concurrentShipment = await findShipment(
+                  env.KOORTA_DB,
+                  orderNumber,
+                  direction,
+                  direction === "reverse" ? returnTransactionId : null,
+                );
+                if (concurrentShipment) {
+                  return buildError(
+                    "Another shipment action created a record. Reload the order before continuing.",
+                    409,
+                    corsHeaders,
+                  );
+                }
+                if (
+                  error instanceof Error &&
+                  error.message === "Order status changed before the shipment could be reserved."
+                ) {
+                  return buildError(error.message, 409, corsHeaders);
+                }
+                throw error;
+              }
+              shipment.external_order_reference = reference;
+              const result = await advanceShipmentBooking(
+                env.KOORTA_DB,
+                env,
+                order,
+                shipment,
+                direction === "reverse",
+                shiprocketPayload,
+              );
+              return jsonResponse({ success: true, shipment: result }, 200, corsHeaders);
+            } catch (error) {
+              console.error(`Shiprocket ${direction} booking failed for ${orderNumber}:`, error);
+              return buildError(
+                error instanceof Error ? error.message : "Shipment booking failed.",
+                502,
+                corsHeaders,
+              );
+            }
+          }
+
+          if (action === "manual") {
+            const awb = sanitizeString(payload.awb);
+            const courier = sanitizeString(payload.courier);
+            const manualStatus = sanitizeString(payload.status) || "Manual shipment";
+            if (awb.length > 100 || courier.length > 100 || manualStatus.length > 200) {
+              return buildError("Manual shipment details exceed the allowed length.", 400, corsHeaders);
+            }
+            if (direction === "forward" && !["confirmed", "shipped", "delivered"].includes(order.status)) {
+              return buildError("Manual shipping details can be saved only for a confirmed order.", 409, corsHeaders);
+            }
+            if (direction === "reverse") {
+              const returnRequest = order.transactions.find(
+                (transaction) => transaction.transactionId === returnTransactionId,
+              );
+              if (
+                !returnRequest ||
+                returnRequest.metadata?.type !== "return" ||
+                !["approved", "processing"].includes(returnRequest.status)
+              ) {
+                return buildError("Manual reverse-pickup details require an approved return.", 409, corsHeaders);
+              }
+            }
+
+            let shipment = await findShipment(
+              env.KOORTA_DB,
+              orderNumber,
+              direction,
+              returnTransactionId,
+            );
+            if (!shipment) {
+              try {
+                shipment = await createShipmentRecord(
+                  env.KOORTA_DB,
+                  orderNumber,
+                  direction,
+                  direction === "reverse" ? returnTransactionId : null,
+                );
+              } catch (error) {
+                shipment = await findShipment(
+                  env.KOORTA_DB,
+                  orderNumber,
+                  direction,
+                  returnTransactionId,
+                );
+                if (!shipment) throw error;
+              }
+            }
+            await saveShipment(env.KOORTA_DB, shipment.id, {
+              awb: awb || shipment.awb,
+              courier_name: courier || shipment.courier_name,
+              status: "manual",
+              last_event: manualStatus,
+              manual: 1,
+              error: null,
+            });
+            const updated = await findShipment(
+              env.KOORTA_DB,
+              orderNumber,
+              direction,
+              returnTransactionId,
+            );
+            return jsonResponse({ success: true, shipment: shipmentDto(updated) }, 200, corsHeaders);
+          }
+
+          return buildError("Unknown shipping action.", 400, corsHeaders);
+        }
+
         if (parts.length === 4 && parts[3] === "status") {
           const nextStatus = sanitizeString(payload.status);
           const transitions = {
@@ -1797,6 +2715,15 @@ export default {
             .run();
           if (Number(result.meta?.changes || 0) !== 1) {
             return buildError("The order status changed; reload and try again.", 409, corsHeaders);
+          }
+          const shipment = await findShipment(env.KOORTA_DB, orderNumber, "forward");
+          if (shipment) {
+            await saveShipment(env.KOORTA_DB, shipment.id, {
+              status: "manual",
+              last_event: `Admin manually marked ${nextStatus}`,
+              manual: 1,
+              ...(nextStatus === "delivered" ? { delivered_at: updatedAt } : {}),
+            });
           }
           return jsonResponse(
             {
@@ -1988,6 +2915,14 @@ export default {
           )?.status;
           if (!["pending", "confirmed", "cancellation_processing"].includes(orderStatus)) {
             return buildError("Cancellation is allowed only before dispatch.", 409, corsHeaders);
+          }
+          const carrierShipment = await findShipment(env.KOORTA_DB, orderNumber, "forward");
+          if (carrierShipment && carrierShipment.status !== "cancelled") {
+            return buildError(
+              "Cancel the Shiprocket booking first. If it was cancelled in the carrier dashboard, record that manual outcome in Admin and retry.",
+              409,
+              corsHeaders,
+            );
           }
           if (row.status === "cancellation_requested") {
             if (!["pending", "confirmed"].includes(orderStatus)) {
@@ -2446,6 +3381,14 @@ export default {
             .bind(...orderNumbers)
             .all();
           const txs = txResult.results || [];
+          const shipmentsQuery = `SELECT * FROM order_shipments WHERE order_number IN (${placeholders}) ORDER BY created_at`;
+          const shipmentsResult = await env.KOORTA_DB.prepare(shipmentsQuery)
+            .bind(...orderNumbers)
+            .all();
+          const shipmentsByOrder = {};
+          for (const shipment of shipmentsResult.results || []) {
+            (shipmentsByOrder[shipment.order_number] ||= []).push(shipmentDto(shipment));
+          }
 
           const itemsByOrder = {};
           for (const it of items) {
@@ -2498,6 +3441,7 @@ export default {
             total: orderRow.total,
             status: orderRow.status,
             deliveredAt: orderRow.delivered_at || null,
+            shipments: shipmentsByOrder[orderRow.order_number] || [],
             items: itemsByOrder[orderRow.order_number] || [],
             transactions: txByOrder[orderRow.order_number] || [],
           }));

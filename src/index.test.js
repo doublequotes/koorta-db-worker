@@ -364,7 +364,11 @@ function createOrderDatabase({
   shipping = 200,
 } = {}) {
   const database = new DatabaseSync(":memory:");
-  for (const migration of ["001_create_orders.sql", "002_returns_and_delivery.sql"]) {
+  for (const migration of [
+    "001_create_orders.sql",
+    "002_returns_and_delivery.sql",
+    "003_shiprocket_shipments.sql",
+  ]) {
     database.exec(readFileSync(new URL(`../migrations/${migration}`, import.meta.url), "utf8"));
   }
   const placedAt = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
@@ -463,6 +467,322 @@ async function createAccessCredentials() {
   flowAccessTokenFactory = token;
   return flowAccessTokenFactory;
 }
+
+test("books forward and approved reverse Shiprocket shipments and applies carrier events", async () => {
+  const { database, d1 } = createOrderDatabase({
+    orderStatus: "confirmed",
+    paymentStatus: "paid",
+    discount: 0,
+    shipping: 0,
+  });
+  const tokenFactory = await createAccessCredentials();
+  const access = await tokenFactory();
+  const originalFetch = globalThis.fetch;
+  const shipmentCalls = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes("/cdn-cgi/access/certs")) {
+      return new Response(JSON.stringify({ keys: [access.jwk] }), { status: 200 });
+    }
+    if (url.endsWith("/auth/login")) {
+      return new Response(JSON.stringify({ token: "shiprocket-test-token" }), { status: 200 });
+    }
+    const body = init.body ? JSON.parse(init.body) : null;
+    shipmentCalls.push({ url, body });
+    if (url.endsWith("/orders/create/adhoc")) {
+      assert.match(body.order_id, /^\d+$/);
+      assert.equal(body.pickup_location, "Test Warehouse");
+      assert.equal(body.payment_method, "Prepaid");
+      return new Response(JSON.stringify({ order_id: 7001, shipment_id: 8001 }), {
+        status: 200,
+      });
+    }
+    if (url.endsWith("/orders/create/return")) {
+      assert.equal(body.shipping_pincode, 400001);
+      assert.equal(body.pickup_pincode, 400001);
+      return new Response(JSON.stringify({ order_id: 7002, shipment_id: 8002 }), {
+        status: 200,
+      });
+    }
+    if (url.endsWith("/courier/assign/awb")) {
+      assert.equal(init.headers.Authorization, "Bearer shiprocket-test-token");
+      return new Response(
+        JSON.stringify({
+          response: {
+            data: {
+              awb_code: body.is_return ? "RETURN-AWB" : "FORWARD-AWB",
+              courier_name: "Test Courier",
+            },
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (url.endsWith("/courier/generate/pickup")) {
+      return new Response(JSON.stringify({ pickup_status: 1 }), { status: 200 });
+    }
+    if (url.endsWith("/manifests/generate")) {
+      return new Response(
+        JSON.stringify({ status: 1, manifest_url: "https://example.test/manifest.pdf" }),
+        { status: 200 },
+      );
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  const env = {
+    KOORTA_DB: d1,
+    ACCESS_ISSUER: "https://koorta-flow-test.cloudflareaccess.com",
+    ACCESS_AUD: "koorta-flow-test-audience",
+    SHIPROCKET_EMAIL: "worker@example.test",
+    SHIPROCKET_PASSWORD: "test-password",
+    SHIPROCKET_PICKUP_LOCATION: "Test Warehouse",
+    SHIPROCKET_PARCEL_LENGTH: "25",
+    SHIPROCKET_PARCEL_BREADTH: "20",
+    SHIPROCKET_PARCEL_HEIGHT: "5",
+    SHIPROCKET_PARCEL_WEIGHT: "0.5",
+    SHIPROCKET_RETURN_NAME: "Koorta Warehouse",
+    SHIPROCKET_RETURN_ADDRESS: "2 Test Road",
+    SHIPROCKET_RETURN_CITY: "Mumbai",
+    SHIPROCKET_RETURN_STATE: "Maharashtra",
+    SHIPROCKET_RETURN_PINCODE: "400001",
+    SHIPROCKET_RETURN_PHONE: "9820000000",
+    SHIPROCKET_RETURN_EMAIL: "returns@example.test",
+    SHIPROCKET_WEBHOOK_SECRET: "test-webhook-secret",
+  };
+  const adminHeaders = {
+    "content-type": "application/json",
+    "cf-access-jwt-assertion": access.token,
+  };
+
+  try {
+    const forwardResponse = await worker.fetch(
+      new Request("https://db.koorta.com/admin/orders/ORD-1/shipping", {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({ action: "book", direction: "forward" }),
+      }),
+      env,
+    );
+    assert.equal(forwardResponse.status, 200);
+    const forwardBody = await forwardResponse.json();
+    assert.equal(forwardBody.shipment.status, "booked");
+    assert.equal(forwardBody.shipment.awb, "FORWARD-AWB");
+    assert.equal(database.prepare("SELECT status FROM orders WHERE order_number = ?").get("ORD-1").status, "confirmed");
+
+    database
+      .prepare(
+        `INSERT INTO transactions (
+          transaction_id, order_number, provider, method, status, amount, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "return-approved",
+        "ORD-1",
+        "koorta",
+        "return",
+        "approved",
+        -800,
+        JSON.stringify({
+          type: "return",
+          items: [{ itemId: "item-1", name: "Linen Kurta", size: "M", qty: 1 }],
+        }),
+      );
+    const reverseResponse = await worker.fetch(
+      new Request("https://db.koorta.com/admin/orders/ORD-1/shipping", {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({
+          action: "book",
+          direction: "reverse",
+          transactionId: "return-approved",
+        }),
+      }),
+      env,
+    );
+    assert.equal(reverseResponse.status, 200);
+    const reverseBody = await reverseResponse.json();
+    assert.equal(reverseBody.shipment.status, "booked");
+    assert.equal(reverseBody.shipment.awb, "RETURN-AWB");
+    assert.ok(shipmentCalls.some((call) => call.url.endsWith("/orders/create/return")));
+    assert.ok(
+      shipmentCalls.some(
+        (call) =>
+          call.url.endsWith("/courier/assign/awb") && call.body.is_return === 1,
+      ),
+    );
+
+    const unauthorizedWebhook = await worker.fetch(
+      new Request("https://db.koorta.com/webhooks/carrier-events", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": "wrong-secret" },
+        body: JSON.stringify({ awb: "FORWARD-AWB", current_status: "PICKED UP" }),
+      }),
+      env,
+    );
+    assert.equal(unauthorizedWebhook.status, 401);
+
+    const pickedUp = await worker.fetch(
+      new Request("https://db.koorta.com/webhooks/carrier-events", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": "test-webhook-secret" },
+        body: JSON.stringify({
+          awb: "FORWARD-AWB",
+          courier_name: "Test Courier",
+          current_status: "PICKED UP",
+          current_timestamp: "11 Nov 2026 10:00:00",
+        }),
+      }),
+      env,
+    );
+    assert.equal(pickedUp.status, 200);
+    assert.equal(database.prepare("SELECT status FROM orders WHERE order_number = ?").get("ORD-1").status, "shipped");
+
+    await worker.fetch(
+      new Request("https://db.koorta.com/webhooks/carrier-events", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": "test-webhook-secret" },
+        body: JSON.stringify({
+          awb: "FORWARD-AWB",
+          current_status: "DELIVERED",
+          current_timestamp: "12 11 2026 10:00:00",
+        }),
+      }),
+      env,
+    );
+    assert.equal(
+      database.prepare("SELECT delivered_at FROM orders WHERE order_number = ?").get("ORD-1").delivered_at,
+      "2026-11-12T04:30:00.000Z",
+    );
+    await worker.fetch(
+      new Request("https://db.koorta.com/webhooks/carrier-events", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": "test-webhook-secret" },
+        body: JSON.stringify({ awb: "FORWARD-AWB", current_status: "IN TRANSIT" }),
+      }),
+      env,
+    );
+    assert.equal(database.prepare("SELECT status FROM orders WHERE order_number = ?").get("ORD-1").status, "delivered");
+
+    for (const [current_status, expectedStatus] of [
+      ["RTO In Transit", "rto_in_transit"],
+      ["RTO Delivered", "rto_received"],
+      ["DELIVERED", "rto_received"],
+    ]) {
+      await worker.fetch(
+        new Request("https://db.koorta.com/webhooks/carrier-events", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-api-key": "test-webhook-secret" },
+          body: JSON.stringify({ awb: "FORWARD-AWB", current_status }),
+        }),
+        env,
+      );
+      assert.equal(
+        database.prepare("SELECT status FROM order_shipments WHERE order_number = ? AND direction = 'forward'")
+          .get("ORD-1").status,
+        expectedStatus,
+      );
+    }
+
+    await worker.fetch(
+      new Request("https://db.koorta.com/webhooks/carrier-events", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": "test-webhook-secret" },
+        body: JSON.stringify({ awb: "RETURN-AWB", current_status: "DELIVERED" }),
+      }),
+      env,
+    );
+    assert.equal(database.prepare("SELECT status FROM orders WHERE order_number = ?").get("ORD-1").status, "delivered");
+    const reverseShipment = database
+      .prepare("SELECT status FROM order_shipments WHERE return_transaction_id = ?")
+      .get("return-approved");
+    assert.equal(reverseShipment.status, "delivered");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("keeps ambiguous Shiprocket booking failures manual and saves manual fallback details", async () => {
+  const { database, d1 } = createOrderDatabase({
+    orderStatus: "confirmed",
+    paymentStatus: "paid",
+    discount: 0,
+    shipping: 0,
+  });
+  const tokenFactory = await createAccessCredentials();
+  const access = await tokenFactory();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/cdn-cgi/access/certs")) {
+      return new Response(JSON.stringify({ keys: [access.jwk] }), { status: 200 });
+    }
+    if (url.endsWith("/auth/login")) {
+      return new Response(JSON.stringify({ token: "shiprocket-test-token" }), { status: 200 });
+    }
+    if (url.endsWith("/orders/create/adhoc")) {
+      return new Response(JSON.stringify({ message: "Temporary carrier error" }), {
+        status: 503,
+      });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  const env = {
+    KOORTA_DB: d1,
+    ACCESS_ISSUER: "https://koorta-flow-test.cloudflareaccess.com",
+    ACCESS_AUD: "koorta-flow-test-audience",
+    SHIPROCKET_EMAIL: "worker@example.test",
+    SHIPROCKET_PASSWORD: "test-password",
+    SHIPROCKET_PICKUP_LOCATION: "Test Warehouse",
+    SHIPROCKET_PARCEL_LENGTH: "25",
+    SHIPROCKET_PARCEL_BREADTH: "20",
+    SHIPROCKET_PARCEL_HEIGHT: "5",
+    SHIPROCKET_PARCEL_WEIGHT: "0.5",
+  };
+  const headers = {
+    "content-type": "application/json",
+    "cf-access-jwt-assertion": access.token,
+  };
+  try {
+    const failedBooking = await worker.fetch(
+      new Request("https://db.koorta.com/admin/orders/ORD-1/shipping", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ action: "book", direction: "forward" }),
+      }),
+      env,
+    );
+    assert.equal(failedBooking.status, 502);
+    assert.equal(
+      database.prepare("SELECT status FROM order_shipments WHERE order_number = ?").get("ORD-1")
+        .status,
+      "booking_uncertain",
+    );
+
+    const manualUpdate = await worker.fetch(
+      new Request("https://db.koorta.com/admin/orders/ORD-1/shipping", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          action: "manual",
+          direction: "forward",
+          awb: "MANUAL-AWB",
+          courier: "Local courier",
+          status: "Handed to courier",
+        }),
+      }),
+      env,
+    );
+    assert.equal(manualUpdate.status, 200);
+    const manualBody = await manualUpdate.json();
+    assert.equal(manualBody.shipment.manual, true);
+    assert.equal(manualBody.shipment.awb, "MANUAL-AWB");
+    assert.equal(manualBody.shipment.lastEvent, "Handed to courier");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 function createBucket(initialCatalog) {
   let catalog = initialCatalog;

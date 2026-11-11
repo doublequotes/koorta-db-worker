@@ -8,7 +8,31 @@ ACCESS_AUD = "1016bc0e09dd8e7703407cb47a90270907c16d523044f44f71b0ba3ac73acc03"
 ADMIN_UI_ORIGINS = "https://koorta.com"
 RESEND_FROM_EMAIL = "Koorta Orders <admin@koorta.com>"
 TURNSTILE_HOSTNAMES = "koorta.com,www.koorta.com"
-#TURNSTILE_SECRET_KEY = "Add it to settings on worker as secret. Not here"
+
+# Secret references only. Set these with `npx wrangler secret put <NAME>`;
+# do not uncomment or add secret values to this file.
+# RESEND_API_KEY
+# TURNSTILE_SECRET_KEY
+# SHIPROCKET_EMAIL
+# SHIPROCKET_PASSWORD
+# SHIPROCKET_WEBHOOK_SECRET
+
+# Match this label exactly to a pickup location configured in the Shiprocket account.
+SHIPROCKET_PICKUP_LOCATION = ""
+# Starting estimate for two folded men's kurtas in one poly-mailer; measure the packed parcel.
+SHIPROCKET_PARCEL_LENGTH = "30"
+SHIPROCKET_PARCEL_BREADTH = "25"
+SHIPROCKET_PARCEL_HEIGHT = "8"
+SHIPROCKET_PARCEL_WEIGHT = "1.0"
+# Reverse-pickup destination (can be the same premises, but is a full address, not the label above).
+SHIPROCKET_RETURN_NAME = "KOORTA.com"
+SHIPROCKET_RETURN_ADDRESS = "Meghwal-Ramnagar Road, Plot No. 377, Naraynapur, Ward No. 7"
+SHIPROCKET_RETURN_CITY = "Ramnagar"
+SHIPROCKET_RETURN_STATE = "Bihar"
+SHIPROCKET_RETURN_PINCODE = "845106"
+SHIPROCKET_RETURN_PHONE = "+917838534597"
+SHIPROCKET_RETURN_EMAIL = "admin@koorta.com"
+SHIPROCKET_RETURN_PICKUP_EMAIL = "admin@koorta.com"
 
 [[d1_databases]]
 binding = "KOORTA_DB"
