@@ -702,6 +702,83 @@ test("books forward and approved reverse Shiprocket shipments and applies carrie
   }
 });
 
+test("reports Shiprocket response ID paths without logging response values", async () => {
+  const { database, d1 } = createOrderDatabase({
+    orderStatus: "confirmed",
+    paymentStatus: "paid",
+    discount: 0,
+    shipping: 0,
+  });
+  const tokenFactory = await createAccessCredentials();
+  const access = await tokenFactory();
+  const originalFetch = globalThis.fetch;
+  const originalConsoleError = console.error;
+  const diagnosticLogs = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/cdn-cgi/access/certs")) {
+      return new Response(JSON.stringify({ keys: [access.jwk] }), { status: 200 });
+    }
+    if (url.endsWith("/auth/login")) {
+      return new Response(JSON.stringify({ token: "shiprocket-test-token" }), { status: 200 });
+    }
+    if (url.endsWith("/orders/create/adhoc")) {
+      return new Response(
+        JSON.stringify({
+          message: "Order created",
+          order_id: 7001,
+          shipment: { id: 8001, customer_email: "private@example.test" },
+        }),
+        { status: 200 },
+      );
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  console.error = (...args) => diagnosticLogs.push(args.join(" "));
+
+  const env = {
+    KOORTA_DB: d1,
+    ACCESS_ISSUER: "https://koorta-flow-test.cloudflareaccess.com",
+    ACCESS_AUD: "koorta-flow-test-audience",
+    SHIPROCKET_EMAIL: "worker@example.test",
+    SHIPROCKET_PASSWORD: "test-password",
+    SHIPROCKET_PICKUP_LOCATION: "Test Warehouse",
+    SHIPROCKET_PARCEL_LENGTH: "25",
+    SHIPROCKET_PARCEL_BREADTH: "20",
+    SHIPROCKET_PARCEL_HEIGHT: "5",
+    SHIPROCKET_PARCEL_WEIGHT: "0.5",
+  };
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://db.koorta.com/admin/orders/ORD-1/shipping", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "cf-access-jwt-assertion": access.token,
+        },
+        body: JSON.stringify({ action: "book", direction: "forward" }),
+      }),
+      env,
+    );
+    const body = await response.json();
+    assert.equal(response.status, 502);
+    assert.match(body.error, /Top-level fields: message, order_id, shipment/);
+    assert.match(body.error, /shipment\.id: present \(number\)/);
+    assert.doesNotMatch(body.error, /private@example\.test/);
+    assert.match(diagnosticLogs.join("\n"), /shipment\.id: present \(number\)/);
+    assert.doesNotMatch(diagnosticLogs.join("\n"), /private@example\.test/);
+    assert.equal(
+      database.prepare("SELECT status FROM order_shipments WHERE order_number = ?").get("ORD-1")
+        .status,
+      "booking_uncertain",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.error = originalConsoleError;
+  }
+});
+
 test("keeps ambiguous Shiprocket booking failures manual and saves manual fallback details", async () => {
   const { database, d1 } = createOrderDatabase({
     orderStatus: "confirmed",

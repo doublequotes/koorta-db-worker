@@ -183,6 +183,47 @@ function getShipmentResult(data) {
   return data?.response?.data || data?.data || data || {};
 }
 
+function summarizeShiprocketCreateResponse(data) {
+  if (data === null) return "Response was null or not valid JSON.";
+  if (typeof data !== "object") return `Response JSON type: ${typeof data}.`;
+
+  const topLevelKeys = Object.keys(data)
+    .slice(0, 30)
+    .map((key) => key.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40));
+  const idFields = [];
+  let visited = 0;
+
+  const inspect = (value, path = "", depth = 0) => {
+    if (!value || typeof value !== "object" || depth > 4 || visited >= 100) return;
+    if (Array.isArray(value)) {
+      value.slice(0, 5).forEach((item, index) => inspect(item, `${path}[${index}]`, depth + 1));
+      return;
+    }
+
+    for (const [key, child] of Object.entries(value).slice(0, 30)) {
+      visited += 1;
+      const safeKey = key.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40);
+      const childPath = path ? `${path}.${safeKey}` : safeKey;
+      if (/^(shipment[_-]?id|order[_-]?id|id)$/i.test(key)) {
+        const usable =
+          (typeof child === "string" && child.trim().length > 0) ||
+          (typeof child === "number" && Number.isFinite(child) && child > 0);
+        idFields.push(
+          `${childPath}: ${usable ? "present" : "empty"} (${child === null ? "null" : typeof child})`,
+        );
+      }
+      inspect(child, childPath, depth + 1);
+      if (visited >= 100) break;
+    }
+  };
+  inspect(data);
+
+  const fields = topLevelKeys.length > 0 ? topLevelKeys.join(", ") : "(none)";
+  const identifiers =
+    idFields.length > 0 ? idFields.join("; ") : "no order/shipment ID fields found";
+  return `Top-level fields: ${fields}. ID field paths: ${identifiers}. Values omitted.`;
+}
+
 function mapCarrierStatus(status) {
   const normalized = sanitizeString(status).toLowerCase();
   if (!normalized) return { status: "tracking_update", orderStatus: null };
@@ -1175,14 +1216,15 @@ async function advanceShipmentBooking(db, env, order, initialShipment, isReturn,
     }
     const ids = getExternalIds(created);
     if (!ids.shipmentId) {
+      const diagnostic = summarizeShiprocketCreateResponse(created);
+      const message = `Shiprocket returned no usable shipment ID. ${diagnostic}`;
+      console.error(`Shiprocket order creation response for ${order.orderNumber}: ${diagnostic}`);
       await saveShipment(db, shipment.id, {
         shiprocket_order_id: ids.orderId || null,
         status: "booking_uncertain",
-        error: "Shiprocket did not return a shipment ID. Verify the order in Shiprocket before proceeding.",
+        error: message,
       });
-      throw new Error(
-        "Shiprocket did not return a shipment ID. Verify the order in Shiprocket before proceeding.",
-      );
+      throw new Error(message);
     }
     await saveShipment(db, shipment.id, {
       shiprocket_order_id: ids.orderId || null,
