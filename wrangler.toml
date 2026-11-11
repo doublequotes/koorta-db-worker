@@ -41,3 +41,19 @@ database_name = "koorta_db"
 [[r2_buckets]]
 binding = "GARMENT_BUCKET"
 bucket_name = "garment-catalog"
+
+# ...
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+persist = true
+
+[observability.issue_detection]
+enabled = true
+# ...
