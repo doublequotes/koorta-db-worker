@@ -224,6 +224,19 @@ function summarizeShiprocketCreateResponse(data) {
   return `Top-level fields: ${fields}. ID field paths: ${identifiers}. Values omitted.`;
 }
 
+function getShiprocketCreateError(data) {
+  const message = sanitizeString(data?.message);
+  if (
+    message &&
+    (data?.success === false ||
+      Number(data?.status_code) >= 400 ||
+      /wrong pickup location entered/i.test(message))
+  ) {
+    return message;
+  }
+  return "";
+}
+
 function mapCarrierStatus(status) {
   const normalized = sanitizeString(status).toLowerCase();
   if (!normalized) return { status: "tracking_update", orderStatus: null };
@@ -1187,6 +1200,11 @@ async function advanceShipmentBooking(db, env, order, initialShipment, isReturn,
           ? "booking_failed"
           : "booking_error";
     const message = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+    const httpStatus =
+      error instanceof ShiprocketApiError ? ` (HTTP ${error.status})` : "";
+    console.error(
+      `Shiprocket ${creatingOrder ? "order creation" : "shipment booking"} failed for ${order.orderNumber}${httpStatus}: ${message}`,
+    );
     await saveShipment(db, shipment.id, { status, error: message });
     throw new Error(message);
   };
@@ -1211,18 +1229,21 @@ async function advanceShipmentBooking(db, env, order, initialShipment, isReturn,
     try {
       const path = isReturn ? "/orders/create/return" : "/orders/create/adhoc";
       created = await shiprocketRequest(env, path, returnPayload);
-      console.log(`Shiprocket order creation response for ${order.orderNumber}:`, JSON.stringify(created, null, 2));
     } catch (error) {
       return failBooking(error, true);
     }
     const ids = getExternalIds(created);
     if (!ids.shipmentId) {
       const diagnostic = summarizeShiprocketCreateResponse(created);
-      const message = `Shiprocket returned no usable shipment ID. ${diagnostic}`;
-      console.error(`Shiprocket order creation response for ${order.orderNumber}: ${diagnostic}`);
+      const carrierError = getShiprocketCreateError(created);
+      const message = carrierError || `Shiprocket returned no usable shipment ID. ${diagnostic}`;
+      const status = carrierError ? "booking_failed" : "booking_uncertain";
+      console.error(
+        `Shiprocket order creation failed for ${order.orderNumber}: ${message}. ${diagnostic}`,
+      );
       await saveShipment(db, shipment.id, {
         shiprocket_order_id: ids.orderId || null,
-        status: "booking_uncertain",
+        status,
         error: message,
       });
       throw new Error(message);
@@ -2641,7 +2662,6 @@ export default {
                 throw error;
               }
               shipment.external_order_reference = reference;
-              console.log(`shiprocketPayload:`, JSON.stringify(shiprocketPayload, null, 2));
               const result = await advanceShipmentBooking(
                 env.KOORTA_DB,
                 env,

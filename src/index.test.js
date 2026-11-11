@@ -702,7 +702,7 @@ test("books forward and approved reverse Shiprocket shipments and applies carrie
   }
 });
 
-test("reports Shiprocket response ID paths without logging response values", async () => {
+test("logs and saves Shiprocket create errors without logging response values", async () => {
   const { database, d1 } = createOrderDatabase({
     orderStatus: "confirmed",
     paymentStatus: "paid",
@@ -713,6 +713,7 @@ test("reports Shiprocket response ID paths without logging response values", asy
   const access = await tokenFactory();
   const originalFetch = globalThis.fetch;
   const originalConsoleError = console.error;
+  const originalConsoleLog = console.log;
   const diagnosticLogs = [];
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -725,9 +726,19 @@ test("reports Shiprocket response ID paths without logging response values", asy
     if (url.endsWith("/orders/create/adhoc")) {
       return new Response(
         JSON.stringify({
-          message: "Order created",
-          order_id: 7001,
-          shipment: { id: 8001, customer_email: "private@example.test" },
+          message: "Wrong Pickup location entered. Please choose one location from the data given",
+          data: {
+            data: [
+              {
+                phone_verified: 1,
+                id: 8001,
+                pickup_location: "work",
+                address: "private address",
+                email: "private@example.test",
+                phone: "9999999999",
+              },
+            ],
+          },
         }),
         { status: 200 },
       );
@@ -735,6 +746,7 @@ test("reports Shiprocket response ID paths without logging response values", asy
     throw new Error(`Unexpected fetch: ${url}`);
   };
   console.error = (...args) => diagnosticLogs.push(args.join(" "));
+  console.log = (...args) => diagnosticLogs.push(args.join(" "));
 
   const env = {
     KOORTA_DB: d1,
@@ -763,19 +775,25 @@ test("reports Shiprocket response ID paths without logging response values", asy
     );
     const body = await response.json();
     assert.equal(response.status, 502);
-    assert.match(body.error, /Top-level fields: message, order_id, shipment/);
-    assert.match(body.error, /shipment\.id: present \(number\)/);
-    assert.doesNotMatch(body.error, /private@example\.test/);
-    assert.match(diagnosticLogs.join("\n"), /shipment\.id: present \(number\)/);
-    assert.doesNotMatch(diagnosticLogs.join("\n"), /private@example\.test/);
     assert.equal(
-      database.prepare("SELECT status FROM order_shipments WHERE order_number = ?").get("ORD-1")
-        .status,
-      "booking_uncertain",
+      body.error,
+      "Wrong Pickup location entered. Please choose one location from the data given",
+    );
+    assert.match(diagnosticLogs.join("\n"), /data\.data\[0\]\.id: present \(number\)/);
+    assert.match(diagnosticLogs.join("\n"), /Wrong Pickup location entered/);
+    assert.doesNotMatch(diagnosticLogs.join("\n"), /private@example\.test|9999999999|private address/);
+    const shipment = database
+      .prepare("SELECT status, error FROM order_shipments WHERE order_number = ?")
+      .get("ORD-1");
+    assert.equal(shipment.status, "booking_failed");
+    assert.equal(
+      shipment.error,
+      "Wrong Pickup location entered. Please choose one location from the data given",
     );
   } finally {
     globalThis.fetch = originalFetch;
     console.error = originalConsoleError;
+    console.log = originalConsoleLog;
   }
 });
 

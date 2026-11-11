@@ -18,7 +18,7 @@ TURNSTILE_HOSTNAMES = "koorta.com,www.koorta.com"
 # SHIPROCKET_WEBHOOK_SECRET
 
 # Match this label exactly to a pickup location configured in the Shiprocket account.
-SHIPROCKET_PICKUP_LOCATION = "KOORTA.COM, WARD NO-11, NARAYANPUR,, 100 MTS AHEAD GANESH KHAD BHANDAR, West Champaran, Bihar, India, 845106"
+SHIPROCKET_PICKUP_LOCATION = "work"
 # Starting estimate for two folded men's kurtas in one poly-mailer; measure the packed parcel.
 SHIPROCKET_PARCEL_LENGTH = "30"
 SHIPROCKET_PARCEL_BREADTH = "25"
