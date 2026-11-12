@@ -8,6 +8,9 @@ ACCESS_AUD = "1016bc0e09dd8e7703407cb47a90270907c16d523044f44f71b0ba3ac73acc03"
 ADMIN_UI_ORIGINS = "https://koorta.com"
 RESEND_FROM_EMAIL = "Koorta Orders <admin@koorta.com>"
 TURNSTILE_HOSTNAMES = "koorta.com,www.koorta.com"
+# Full Shiprocket API base URL. Use the sandbox endpoint and API-user secrets when testing.
+# SHIPROCKET_API_BASE_URL = "https://apiv2.shiprocket.in/v1/external"
+SHIPROCKET_API_BASE_URL = "https://api-sandbox.shiprocket.in/v1/external"
 
 # Secret references only. Set these with `npx wrangler secret put <NAME>`;
 # do not uncomment or add secret values to this file.

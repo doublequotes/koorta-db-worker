@@ -26,6 +26,7 @@ test("reuses the Shiprocket auth token from KV across Worker isolates", async ()
     .toString("base64url");
   const token = `header.${tokenPayload}.signature`;
   const originalFetch = globalThis.fetch;
+  const authUrls = [];
   const cache = {
     async get(key) {
       return cachedValues.get(key) || null;
@@ -39,7 +40,7 @@ test("reuses the Shiprocket auth token from KV across Worker isolates", async ()
     },
   };
   globalThis.fetch = async (input) => {
-    assert.equal(String(input), "https://apiv2.shiprocket.in/v1/external/auth/login");
+    authUrls.push(String(input));
     authCalls += 1;
     return new Response(JSON.stringify({ token }), { status: 200 });
   };
@@ -48,16 +49,43 @@ test("reuses the Shiprocket auth token from KV across Worker isolates", async ()
     const env = {
       SHIPROCKET_EMAIL: "worker@example.test",
       SHIPROCKET_PASSWORD: "test-password",
+      SHIPROCKET_API_BASE_URL: "https://sandbox.example.test/v1/external/",
       SHIPROCKET_TOKEN_CACHE: cache,
     };
     const firstIsolate = await import("./index.js?shiprocket-kv-first-isolate");
     assert.equal(await firstIsolate.getShiprocketToken(env, true), token);
     assert.equal(authCalls, 1);
+    assert.deepEqual(authUrls, ["https://sandbox.example.test/v1/external/auth/login"]);
     assert.ok(Math.abs(cacheTtls[0] - (10 * 24 * 60 * 60 - 60)) <= 1);
 
     const secondIsolate = await import("./index.js?shiprocket-kv-second-isolate");
     assert.equal(await secondIsolate.getShiprocketToken(env), token);
     assert.equal(authCalls, 1);
+
+    const productionEnv = {
+      ...env,
+      SHIPROCKET_API_BASE_URL: "https://apiv2.shiprocket.in/v1/external",
+    };
+    assert.equal(await firstIsolate.getShiprocketToken(productionEnv), token);
+    assert.equal(authCalls, 2);
+    assert.deepEqual(authUrls, [
+      "https://sandbox.example.test/v1/external/auth/login",
+      "https://apiv2.shiprocket.in/v1/external/auth/login",
+    ]);
+
+    const productionIsolate = await import("./index.js?shiprocket-kv-production-isolate");
+    assert.equal(await productionIsolate.getShiprocketToken(productionEnv), token);
+    assert.equal(authCalls, 2);
+
+    const requestIsolate = await import("./index.js?shiprocket-configured-api-request");
+    globalThis.fetch = async (input) => {
+      assert.equal(String(input), "https://sandbox.example.test/v1/external/orders/create/adhoc");
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    };
+    assert.deepEqual(
+      await requestIsolate.shiprocketRequest(env, "/orders/create/adhoc", {}),
+      { success: true },
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

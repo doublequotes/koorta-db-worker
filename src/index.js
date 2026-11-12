@@ -91,45 +91,83 @@ function getShiprocketDimensions(env) {
   return dimensions;
 }
 
+function getShiprocketApiBase(env) {
+  const configuredBase = sanitizeString(env.SHIPROCKET_API_BASE_URL);
+  if (!configuredBase) return SHIPROCKET_API_BASE;
+
+  let url;
+  try {
+    url = new URL(configuredBase);
+  } catch {
+    throw new Error("SHIPROCKET_API_BASE_URL must be a valid HTTPS API base URL.");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    url.pathname === "/"
+  ) {
+    throw new Error(
+      "SHIPROCKET_API_BASE_URL must be an HTTPS API base URL ending with its API path, such as /v1/external.",
+    );
+  }
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+}
+
+async function getShiprocketTokenCacheKey(env, apiBase) {
+  const identity = `${apiBase}\n${sanitizeString(env.SHIPROCKET_EMAIL).toLowerCase()}`;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity));
+  return `${SHIPROCKET_TOKEN_CACHE_KEY}:${Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("")}`;
+}
+
 async function getShiprocketToken(env, forceRefresh = false) {
   if (!sanitizeString(env.SHIPROCKET_EMAIL) || !sanitizeString(env.SHIPROCKET_PASSWORD)) {
     throw new Error("Shiprocket API credentials are not configured.");
   }
+  const apiBase = getShiprocketApiBase(env);
+  const cacheKey = await getShiprocketTokenCacheKey(env, apiBase);
   if (forceRefresh) {
     shiprocketTokenCache = null;
-    await env.SHIPROCKET_TOKEN_CACHE?.delete(SHIPROCKET_TOKEN_CACHE_KEY);
+    await env.SHIPROCKET_TOKEN_CACHE?.delete(cacheKey);
   } else {
     const now = Date.now();
-    if (shiprocketTokenCache && shiprocketTokenCache.expiresAt > now) {
+    if (
+      shiprocketTokenCache?.cacheKey === cacheKey &&
+      shiprocketTokenCache.expiresAt > now
+    ) {
       return shiprocketTokenCache.token;
     }
 
     if (env.SHIPROCKET_TOKEN_CACHE) {
-      const cachedValue = await env.SHIPROCKET_TOKEN_CACHE.get(SHIPROCKET_TOKEN_CACHE_KEY);
+      const cachedValue = await env.SHIPROCKET_TOKEN_CACHE.get(cacheKey);
       if (cachedValue) {
         let cached;
         try {
           cached = JSON.parse(cachedValue);
         } catch {
           console.warn("Discarding malformed Shiprocket auth token from KV.");
-          await env.SHIPROCKET_TOKEN_CACHE.delete(SHIPROCKET_TOKEN_CACHE_KEY);
+          await env.SHIPROCKET_TOKEN_CACHE.delete(cacheKey);
         }
         if (
           typeof cached?.token === "string" &&
           Number.isFinite(cached.expiresAt) &&
           cached.expiresAt > now
         ) {
-          shiprocketTokenCache = cached;
+          shiprocketTokenCache = { ...cached, cacheKey };
           return cached.token;
         }
-        if (cached) await env.SHIPROCKET_TOKEN_CACHE.delete(SHIPROCKET_TOKEN_CACHE_KEY);
+        if (cached) await env.SHIPROCKET_TOKEN_CACHE.delete(cacheKey);
       }
     }
   }
 
   let response;
   try {
-    response = await fetch(`${SHIPROCKET_API_BASE}/auth/login`, {
+    response = await fetch(`${apiBase}/auth/login`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -166,11 +204,11 @@ async function getShiprocketToken(env, forceRefresh = false) {
     // Shiprocket documents a 240-hour token TTL; use a shorter fallback for opaque tokens.
   }
   if (expiresAt > Date.now()) {
-    shiprocketTokenCache = { token, expiresAt };
+    shiprocketTokenCache = { token, expiresAt, cacheKey };
     if (env.SHIPROCKET_TOKEN_CACHE) {
       const expirationTtl = Math.ceil((expiresAt - Date.now()) / 1000);
       await env.SHIPROCKET_TOKEN_CACHE.put(
-        SHIPROCKET_TOKEN_CACHE_KEY,
+      cacheKey,
         JSON.stringify(shiprocketTokenCache),
         { expirationTtl },
       );
@@ -180,11 +218,12 @@ async function getShiprocketToken(env, forceRefresh = false) {
 }
 
 async function shiprocketRequest(env, path, body, method = "POST") {
+  const apiBase = getShiprocketApiBase(env);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const token = await getShiprocketToken(env, attempt === 1);
     let response;
     try {
-      response = await fetch(`${SHIPROCKET_API_BASE}${path}`, {
+      response = await fetch(`${apiBase}${path}`, {
         method,
         headers: {
           Authorization: `Bearer ${token}`,
@@ -3764,6 +3803,7 @@ export default {
 
 export {
   getShiprocketToken,
+  shiprocketRequest,
   getCorsHeaders,
   collectReservedReturnQuantities,
   isWithinReturnWindow,
