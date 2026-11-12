@@ -198,6 +198,51 @@ test("does not retry a rejected Shiprocket login", async () => {
   }
 });
 
+test("logs Shiprocket login response diagnostics without exposing tokens", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalConsoleError = console.error;
+  const originalConsoleLog = console.log;
+  const errorLogs = [];
+  const successLogs = [];
+  console.error = (...args) => errorLogs.push(args);
+  console.log = (...args) => successLogs.push(args);
+
+  try {
+    const failedLogin = await import("./index.js?shiprocket-auth-non-json-log");
+    globalThis.fetch = async () =>
+      new Response("Gateway rejected request", {
+        status: 498,
+        headers: { "content-type": "text/plain" },
+      });
+    await assert.rejects(
+      failedLogin.getShiprocketToken({
+        SHIPROCKET_EMAIL: "sandbox@example.test",
+        SHIPROCKET_PASSWORD: "sandbox-password",
+        SHIPROCKET_API_BASE_URL: "https://sandbox.example.test/v1/external",
+      }),
+      /Shiprocket authentication failed/,
+    );
+    assert.match(JSON.stringify(errorLogs), /"status":498/);
+    assert.match(JSON.stringify(errorLogs), /"bodyFormat":"non-json"/);
+    assert.match(JSON.stringify(errorLogs), /"bodyLength":24/);
+
+    const successfulLogin = await import("./index.js?shiprocket-auth-success-log");
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ token: "private-test-bearer-token" }), { status: 200 });
+    await successfulLogin.getShiprocketToken({
+      SHIPROCKET_EMAIL: "sandbox@example.test",
+      SHIPROCKET_PASSWORD: "sandbox-password",
+      SHIPROCKET_API_BASE_URL: "https://sandbox.example.test/v1/external",
+    });
+    assert.doesNotMatch(JSON.stringify(successLogs), /private-test-bearer-token/);
+    assert.match(JSON.stringify(successLogs), /"tokenPresent":true/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.error = originalConsoleError;
+    console.log = originalConsoleLog;
+  }
+});
+
 test("normalizes Indian phone numbers consistently", () => {
   assert.equal(normalizePhone("+91 98200 00000"), "9820000000");
   assert.equal(normalizePhone("98200-00000"), "9820000000");

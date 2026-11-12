@@ -130,9 +130,7 @@ async function getShiprocketToken(env, forceRefresh = false) {
     throw new Error("Shiprocket API credentials are not configured.");
   }
   const apiBase = getShiprocketApiBase(env);
-  console.log("Shiprocket API base URL:", apiBase);
   const cacheKey = await getShiprocketTokenCacheKey(env, apiBase);
-  console.log("Shiprocket auth cache key:", cacheKey);
   if (forceRefresh) {
     shiprocketTokenCache = null;
     await env.SHIPROCKET_TOKEN_CACHE?.delete(cacheKey);
@@ -186,16 +184,38 @@ async function getShiprocketToken(env, forceRefresh = false) {
     );
   }
 
-  const data = await response.json().catch(() => null);
-  console.log("Shiprocket auth response:", { status: response.status, data });
+  const contentType = response.headers.get("content-type") || "";
+  const responseBody = await response.text();
+  console.log(responseBody ? `Shiprocket auth response body (${responseBody})` : "Shiprocket auth response body is empty.");
+  
+  let data = null;
+  try {
+    data = responseBody ? JSON.parse(responseBody) : null;
+  } catch {
+    data = null;
+  }
   const token = sanitizeString(data?.token);
   if (!response.ok || !token) {
+    const message = sanitizeString(data?.message).slice(0, 300);
+    console.error("Shiprocket auth response:", {
+      status: response.status,
+      contentType,
+      bodyFormat: data === null ? (responseBody ? "non-json" : "empty") : "json",
+      bodyLength: responseBody.length,
+      responseKeys:
+        data && typeof data === "object" ? Object.keys(data).slice(0, 20) : [],
+      message: message || null,
+    });
     throw new ShiprocketApiError(
-      sanitizeString(data?.message) || "Shiprocket authentication failed.",
+      message || "Shiprocket authentication failed.",
       response.status,
       "/auth/login",
     );
   }
+  console.log("Shiprocket auth succeeded:", {
+    status: response.status,
+    tokenPresent: true,
+  });
 
   let expiresAt = Date.now() + SHIPROCKET_TOKEN_FALLBACK_TTL_MS;
   try {
@@ -214,7 +234,6 @@ async function getShiprocketToken(env, forceRefresh = false) {
   }
   if (expiresAt > Date.now()) {
     shiprocketTokenCache = { token, expiresAt, cacheKey };
-    console.log(JSON.stringify(shiprocketTokenCache, null, 2));
     if (env.SHIPROCKET_TOKEN_CACHE) {
       const expirationTtl = Math.ceil((expiresAt - Date.now()) / 1000);
       await env.SHIPROCKET_TOKEN_CACHE.put(
