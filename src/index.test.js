@@ -225,6 +225,7 @@ test("logs Shiprocket login response diagnostics without exposing tokens", async
     assert.match(JSON.stringify(errorLogs), /"status":498/);
     assert.match(JSON.stringify(errorLogs), /"bodyFormat":"non-json"/);
     assert.match(JSON.stringify(errorLogs), /"bodyLength":24/);
+    assert.match(JSON.stringify(errorLogs), /Gateway rejected request/);
 
     const successfulLogin = await import("./index.js?shiprocket-auth-success-log");
     globalThis.fetch = async () =>

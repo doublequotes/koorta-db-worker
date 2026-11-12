@@ -92,6 +92,30 @@ function getShiprocketDimensions(env) {
   return dimensions;
 }
 
+function redactAuthResponseForLogs(value, depth = 0) {
+  if (typeof value === "string") {
+    return value
+      .replace(/Bearer\s+[A-Za-z0-9._~-]+/gi, "Bearer [REDACTED]")
+      .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED_JWT]")
+      .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, "[REDACTED_EMAIL]")
+      .slice(0, 1000);
+  }
+  if (!value || typeof value !== "object" || depth >= 4) return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 10).map((item) => redactAuthResponseForLogs(item, depth + 1));
+  }
+  return Object.fromEntries(
+    Object.entries(value)
+      .slice(0, 30)
+      .map(([key, child]) => [
+        key,
+        /token|password|secret|authorization|email|phone|address/i.test(key)
+          ? "[REDACTED]"
+          : redactAuthResponseForLogs(child, depth + 1),
+      ]),
+  );
+}
+
 function getShiprocketApiBase(env) {
   const configuredBase = sanitizeString(env.SHIPROCKET_API_BASE_URL);
   if (!configuredBase) return SHIPROCKET_API_BASE;
@@ -186,11 +210,13 @@ async function getShiprocketToken(env, forceRefresh = false) {
 
   const contentType = response.headers.get("content-type") || "";
   const responseBody = await response.text();
-  console.log(responseBody ? `Shiprocket auth response body (${responseBody})` : "Shiprocket auth response body is empty.");
-  
   let data = null;
+  let isJson = false;
   try {
-    data = responseBody ? JSON.parse(responseBody) : null;
+    if (responseBody) {
+      data = JSON.parse(responseBody);
+      isJson = true;
+    }
   } catch {
     data = null;
   }
@@ -200,11 +226,22 @@ async function getShiprocketToken(env, forceRefresh = false) {
     console.error("Shiprocket auth response:", {
       status: response.status,
       contentType,
-      bodyFormat: data === null ? (responseBody ? "non-json" : "empty") : "json",
+      bodyFormat: isJson ? "json" : responseBody ? "non-json" : "empty",
       bodyLength: responseBody.length,
       responseKeys:
         data && typeof data === "object" ? Object.keys(data).slice(0, 20) : [],
       message: message || null,
+      responseBody: JSON.stringify(
+        redactAuthResponseForLogs(isJson ? data : responseBody),
+      ).slice(0, 2000),
+      responseHeaders: {
+        server: response.headers.get("server"),
+        cfRay: response.headers.get("cf-ray"),
+        requestId:
+          response.headers.get("x-request-id") ||
+          response.headers.get("x-amzn-requestid") ||
+          response.headers.get("x-amzn-trace-id"),
+      },
     });
     throw new ShiprocketApiError(
       message || "Shiprocket authentication failed.",
