@@ -130,7 +130,9 @@ async function getShiprocketToken(env, forceRefresh = false) {
     throw new Error("Shiprocket API credentials are not configured.");
   }
   const apiBase = getShiprocketApiBase(env);
+  console.log("Shiprocket API base URL:", apiBase);
   const cacheKey = await getShiprocketTokenCacheKey(env, apiBase);
+  console.log("Shiprocket auth cache key:", cacheKey);
   if (forceRefresh) {
     shiprocketTokenCache = null;
     await env.SHIPROCKET_TOKEN_CACHE?.delete(cacheKey);
@@ -185,6 +187,7 @@ async function getShiprocketToken(env, forceRefresh = false) {
   }
 
   const data = await response.json().catch(() => null);
+  console.log("Shiprocket auth response:", { status: response.status, data });
   const token = sanitizeString(data?.token);
   if (!response.ok || !token) {
     throw new ShiprocketApiError(
@@ -211,6 +214,7 @@ async function getShiprocketToken(env, forceRefresh = false) {
   }
   if (expiresAt > Date.now()) {
     shiprocketTokenCache = { token, expiresAt, cacheKey };
+    console.log(JSON.stringify(shiprocketTokenCache, null, 2));
     if (env.SHIPROCKET_TOKEN_CACHE) {
       const expirationTtl = Math.ceil((expiresAt - Date.now()) / 1000);
       await env.SHIPROCKET_TOKEN_CACHE.put(
