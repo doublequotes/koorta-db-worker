@@ -60,10 +60,11 @@ const SHIPROCKET_TOKEN_EXPIRY_SKEW_MS = 60 * 1000;
 let shiprocketTokenCache = null;
 
 class ShiprocketApiError extends Error {
-  constructor(message, status = 0) {
+  constructor(message, status = 0, endpoint = "") {
     super(message);
     this.name = "ShiprocketApiError";
     this.status = status;
+    this.endpoint = endpoint;
   }
 }
 
@@ -176,7 +177,11 @@ async function getShiprocketToken(env, forceRefresh = false) {
       }),
     });
   } catch {
-    throw new ShiprocketApiError("Could not connect to Shiprocket authentication.", 0);
+    throw new ShiprocketApiError(
+      "Could not connect to Shiprocket authentication.",
+      0,
+      "/auth/login",
+    );
   }
 
   const data = await response.json().catch(() => null);
@@ -185,6 +190,7 @@ async function getShiprocketToken(env, forceRefresh = false) {
     throw new ShiprocketApiError(
       sanitizeString(data?.message) || "Shiprocket authentication failed.",
       response.status,
+      "/auth/login",
     );
   }
 
@@ -208,7 +214,7 @@ async function getShiprocketToken(env, forceRefresh = false) {
     if (env.SHIPROCKET_TOKEN_CACHE) {
       const expirationTtl = Math.ceil((expiresAt - Date.now()) / 1000);
       await env.SHIPROCKET_TOKEN_CACHE.put(
-      cacheKey,
+        cacheKey,
         JSON.stringify(shiprocketTokenCache),
         { expirationTtl },
       );
@@ -232,11 +238,11 @@ async function shiprocketRequest(env, path, body, method = "POST") {
         ...(body ? { body: JSON.stringify(body) } : {}),
       });
     } catch {
-      throw new ShiprocketApiError("Could not connect to Shiprocket.", 0);
+      throw new ShiprocketApiError("Could not connect to Shiprocket.", 0, path);
     }
 
     const data = await response.json().catch(() => null);
-    if (response.status === 401 && attempt === 0) continue;
+    if ([401, 498].includes(response.status) && attempt === 0) continue;
     if (!response.ok) {
       const fieldErrors =
         data?.errors && typeof data.errors === "object"
@@ -254,11 +260,12 @@ async function shiprocketRequest(env, path, body, method = "POST") {
           .filter(Boolean)
           .join(" — "),
         response.status,
+        path,
       );
     }
     return data;
   }
-  throw new ShiprocketApiError("Shiprocket authorization failed.", 401);
+  throw new ShiprocketApiError("Shiprocket authorization failed.", 401, path);
 }
 
 function getShipmentResult(data) {
@@ -1284,8 +1291,12 @@ async function advanceShipmentBooking(db, env, order, initialShipment, isReturn,
     const message = (error instanceof Error ? error.message : String(error)).slice(0, 500);
     const httpStatus =
       error instanceof ShiprocketApiError ? ` (HTTP ${error.status})` : "";
+    const endpoint =
+      error instanceof ShiprocketApiError && error.endpoint
+        ? ` at ${error.endpoint}`
+        : "";
     console.error(
-      `Shiprocket ${creatingOrder ? "order creation" : "shipment booking"} failed for ${order.orderNumber}${httpStatus}: ${message}`,
+      `Shiprocket ${creatingOrder ? "order creation" : "shipment booking"} failed for ${order.orderNumber}${endpoint}${httpStatus}: ${message}`,
     );
     await saveShipment(db, shipment.id, { status, error: message });
     throw new Error(message);

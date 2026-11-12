@@ -11,6 +11,7 @@ import {
   isWithinReturnWindow,
   normalizePhone,
   restoreCatalogStockForOrder,
+  shiprocketRequest,
   verifyCloudflareAccess,
   verifyTurnstile,
 } from "./index.js";
@@ -86,6 +87,112 @@ test("reuses the Shiprocket auth token from KV across Worker isolates", async ()
       await requestIsolate.shiprocketRequest(env, "/orders/create/adhoc", {}),
       { success: true },
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("stores a new token before shipment calls and refreshes once after HTTP 498", async () => {
+  const cachedValues = new Map();
+  const cache = {
+    async get(key) {
+      return cachedValues.get(key) || null;
+    },
+    async put(key, value) {
+      cachedValues.set(key, value);
+    },
+    async delete(key) {
+      cachedValues.delete(key);
+    },
+  };
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const tokens = ["sandbox-token-1", "sandbox-token-2"].map(
+    (label) =>
+      `${label}.${Buffer.from(
+        JSON.stringify({ exp: nowSeconds + 10 * 24 * 60 * 60 }),
+      ).toString("base64url")}.signature`,
+  );
+  const originalFetch = globalThis.fetch;
+  let authCalls = 0;
+  let shipmentCalls = 0;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/auth/login")) {
+      assert.equal(cachedValues.size, 0);
+      authCalls += 1;
+      return new Response(JSON.stringify({ token: tokens[authCalls - 1] }), { status: 200 });
+    }
+
+    assert.equal(url, "https://sandbox.example.test/v1/external/orders/create/adhoc");
+    assert.equal(cachedValues.size, 1, "token should be stored in KV before the shipment request");
+    const cachedToken = JSON.parse(Array.from(cachedValues.values())[0]).token;
+    assert.equal(init.headers.Authorization, `Bearer ${cachedToken}`);
+    shipmentCalls += 1;
+    if (shipmentCalls === 1) {
+      assert.equal(cachedToken, tokens[0]);
+      return new Response(JSON.stringify({ message: "Invalid or expired token" }), {
+        status: 498,
+      });
+    }
+    assert.equal(cachedToken, tokens[1]);
+    return new Response(JSON.stringify({ order_id: 7101 }), { status: 200 });
+  };
+
+  try {
+    const module = await import("./index.js?shiprocket-498-token-refresh");
+    const result = await module.shiprocketRequest(
+      {
+        SHIPROCKET_EMAIL: "sandbox@example.test",
+        SHIPROCKET_PASSWORD: "sandbox-password",
+        SHIPROCKET_API_BASE_URL: "https://sandbox.example.test/v1/external",
+        SHIPROCKET_TOKEN_CACHE: cache,
+      },
+      "/orders/create/adhoc",
+      { order_id: "TEST-1" },
+    );
+
+    assert.deepEqual(result, { order_id: 7101 });
+    assert.equal(authCalls, 2);
+    assert.equal(shipmentCalls, 2);
+    assert.equal(JSON.parse(Array.from(cachedValues.values())[0]).token, tokens[1]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("does not retry a rejected Shiprocket login", async () => {
+  let authCalls = 0;
+  let shipmentCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    assert.equal(String(input), "https://sandbox.example.test/v1/external/auth/login");
+    authCalls += 1;
+    return new Response(JSON.stringify({}), { status: 498 });
+  };
+
+  try {
+    const module = await import("./index.js?shiprocket-498-login-failure");
+    await assert.rejects(
+      module.shiprocketRequest(
+        {
+          SHIPROCKET_EMAIL: "sandbox@example.test",
+          SHIPROCKET_PASSWORD: "sandbox-password",
+          SHIPROCKET_API_BASE_URL: "https://sandbox.example.test/v1/external",
+          SHIPROCKET_TOKEN_CACHE: {
+            async get() {
+              return null;
+            },
+            async put() {},
+            async delete() {},
+          },
+        },
+        "/orders/create/adhoc",
+        { order_id: "TEST-2" },
+      ),
+      /Shiprocket authentication failed/,
+    );
+    assert.equal(authCalls, 1);
+    assert.equal(shipmentCalls, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
