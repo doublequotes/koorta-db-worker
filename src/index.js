@@ -1,3 +1,5 @@
+import openApi from "./openapi.js";
+
 function jsonResponse(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
     status,
@@ -1799,6 +1801,52 @@ export default {
           headers: {
             ...corsHeaders,
             "Access-Control-Max-Age": "86400",
+          },
+        });
+      }
+
+      if (route === "/openapi.json" && method === "GET") {
+        return jsonResponse(openApi, 200, {
+          ...corsHeaders,
+          "Cache-Control": "public, max-age=300",
+        });
+      }
+
+      if (route === "/docs" && method === "GET") {
+        const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Koorta DB Worker API</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui.css">
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"></script>
+    <script>
+      window.ui = SwaggerUIBundle({
+        url: "/openapi.json",
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        displayRequestDuration: true,
+        persistAuthorization: true,
+        withCredentials: true,
+        presets: [SwaggerUIBundle.presets.apis],
+        layout: "BaseLayout"
+      });
+    </script>
+  </body>
+</html>`;
+        return new Response(html, {
+          status: 200,
+          headers: {
+            ...corsHeaders,
+            "Cache-Control": "public, max-age=300",
+            "Content-Security-Policy":
+              "default-src 'none'; script-src 'unsafe-inline' https://unpkg.com; style-src 'unsafe-inline' https://unpkg.com; img-src data: https:; connect-src 'self';",
+            "X-Content-Type-Options": "nosniff",
+            "content-type": "text/html; charset=utf-8",
           },
         });
       }

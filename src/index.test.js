@@ -392,6 +392,23 @@ test("reports missing Cloudflare Access configuration for admin routes", async (
   assert.equal(response.status, 503);
 });
 
+test("serves Swagger UI and the OpenAPI document without database configuration", async () => {
+  const docsResponse = await worker.fetch(new Request("https://db.koorta.com/docs"), {});
+  assert.equal(docsResponse.status, 200);
+  assert.match(docsResponse.headers.get("content-type"), /text\/html/);
+  assert.match(await docsResponse.text(), /swagger-ui-bundle\.js/);
+
+  const specResponse = await worker.fetch(new Request("https://db.koorta.com/openapi.json"), {});
+  assert.equal(specResponse.status, 200);
+  assert.match(specResponse.headers.get("content-type"), /application\/json/);
+  const spec = await specResponse.json();
+  assert.equal(spec.openapi, "3.1.0");
+  assert.ok(spec.paths["/orders"].post);
+  assert.ok(spec.paths["/customer/orders/{orderNumber}/requests"].post);
+  assert.ok(spec.paths["/admin/orders/{orderNumber}/shipping"].post);
+  assert.ok(spec.paths["/admin/reports/monthly"].get);
+});
+
 test("generates an Access-protected monthly cash report using India time and completed events only", async () => {
   const { database, d1 } = createOrderDatabase({
     orderStatus: "pending",
